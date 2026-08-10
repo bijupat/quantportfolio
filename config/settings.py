@@ -31,7 +31,7 @@ INSTALLED_APPS = [
     'core',
     'market_data',
     'forecasting',
-    'portfolio'
+    'portfolio',
 ]
 
 MIDDLEWARE = [
@@ -80,3 +80,5 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Custom API Keys
 NEWSAPI_KEY = env('NEWSAPI_KEY', default=None)
+
+
