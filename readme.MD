@@ -100,7 +100,7 @@ QuantPortfolioAI relies on custom Django management commands to handle asynchron
 Downloads historical OHLCV pricing data, constructs market contexts, and seeds database symbols and universes:
 
 ```cmd
-python manage.py fetch_data --universe nifty50 --start 2020-01-01
+python manage.py fetch_prices --universe nifty50 --start 2020-01-01
 
 ```
 
