@@ -160,12 +160,15 @@ def _fetch_altman_data(symbol: str) -> Optional[Dict]:
         return None
 
 
-def calculate_altman_z_score(symbol: str) -> Dict:
+def calculate_altman_z_score(symbol: str, is_financial_hint: Optional[bool] = None) -> Dict:
     """
     Calculate Altman Z-Score for a given non-financial stock.
 
     Args:
         symbol: Yahoo Finance ticker (e.g. 'RELIANCE.NS')
+        is_financial_hint: If provided (e.g. from Symbol.is_financial in the DB),
+            this takes precedence over the ticker-string pattern match below.
+            Pass None to fall back to the string-based heuristic.
 
     Returns:
         dict with keys:
@@ -186,19 +189,30 @@ def calculate_altman_z_score(symbol: str) -> Dict:
     }
 
     # ── Financial sector exclusion ────────────────────────────
-    if _is_financial_sector(symbol):
+    # Prefer an explicit DB-backed hint (Symbol.is_financial) over the
+    # ticker-string heuristic — the heuristic is only a fallback for
+    # callers that don't have a Symbol record on hand.
+    if is_financial_hint is not None:
+        is_financial = is_financial_hint
+        source = "database"
+    else:
+        is_financial = _is_financial_sector(symbol)
+        source = "ticker pattern match"
+
+    if is_financial:
         result["excluded"]       = True
         result["interpretation"] = "Excluded"
         result["warnings"].append(
-            f"Altman Z-Score NOT applicable to financial sector stock ({symbol}). "
-            "The model's assumptions about asset structure and liabilities do not hold "
-            "for banks, NBFCs, and insurance companies."
+            f"Altman Z-Score NOT applicable to financial sector stock ({symbol}), "
+            f"determined via {source}. The model's assumptions about asset structure "
+            "and liabilities do not hold for banks, NBFCs, and insurance companies."
         )
-        log.warning(f"  [{symbol}] Excluded from Altman Z-Score — financial sector")
+        log.warning(f"  [{symbol}] Excluded from Altman Z-Score — financial sector ({source})")
         return result
 
     log.info(f"  [{symbol}] Fetching financial data for Altman Z-Score…")
     data = _fetch_altman_data(symbol)
+    # ... rest of the function is unchanged from here down
 
     if data is None:
         result["interpretation"] = "Insufficient Data"

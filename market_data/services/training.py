@@ -26,23 +26,17 @@ from model_transformer import (
     train_model as keras_train_model,
     evaluate_model as keras_evaluate_model,
 )
-from hybrid_main import (
-    build_hybrid_model,
-    train_hybrid_model as keras_train_hybrid,
-    FINANCIAL_FEATURES,
-    SENTIMENT_FEATURES,
-)
+
 from portfolio_optimizer import walk_forward_splits
-from feature_engineering import (
-    FEATURE_COLUMNS,
-    MARKET_CONTEXT_COLS,
-)
-from data_loader import create_labels
+from market_data.services.indicators import FEATURE_COLUMNS, MARKET_CONTEXT_COLS
 from util import clip_outliers, build_sequences
 
 logger = logging.getLogger(__name__)
 
-
+def create_labels(close: pd.Series, horizon: int = 30) -> pd.Series:
+    """30-day forward return label: (close[t+horizon] - close[t]) / close[t]"""
+    future_close = close.shift(-horizon)
+    return (future_close - close) / (close + 1e-9)
 # ---------------------------------------------------------------------------
 # DB-First Dataset Builder
 # ---------------------------------------------------------------------------

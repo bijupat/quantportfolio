@@ -1,5 +1,5 @@
 from django.core.management.base import BaseCommand
-from core.models import Symbol, Universe, UniverseMembership
+from core.models import Symbol, Universe, UniverseMember
 
 UNIVERSES = {
     # ── Custom watchlist ──────────────────────────
@@ -20,10 +20,13 @@ UNIVERSES = {
     "fmcg": ['BRITANNIA.NS', 'COLPAL.NS', 'DABUR.NS', 'EMAMILTD.NS', 'GODREJCP.NS', 'HINDUNILVR.NS', 'ITC.NS', 'MARICO.NS', 'NESTLEIND.NS', 'PATANJALI.NS', 'RADICO.NS', 'TATACONSUM.NS', 'UBL.NS', 'UNITDSPR.NS', 'VBL.NS'],
 }
 
+
 class Command(BaseCommand):
+    """Seeds the database with predefined stock universes and symbol memberships."""
+
     help = "Seeds database with predefined stock universes and symbol memberships."
 
-    def handle(self, *args, **kwargs):
+    def handle(self, *args, **kwargs) -> None:
         self.stdout.write(self.style.MIGRATE_HEADING("Starting Universe and Symbol Seeding..."))
 
         total_universes = 0
@@ -33,14 +36,14 @@ class Command(BaseCommand):
         banking_tickers = set(UNIVERSES.get("banking", []))
 
         for universe_name, tickers in UNIVERSES.items():
-            universe, created = Universe.objects.get_or_create(
+            universe, _ = Universe.objects.get_or_create(
                 name=universe_name,
                 defaults={"description": f"Predefined universe: {universe_name}"}
             )
             total_universes += 1
 
             for ticker in tickers:
-                exchange = "BSE" if ticker.endswith(".BO") else "NSE"
+                exchange = Symbol.BSE if ticker.endswith(".BO") else Symbol.NSE
                 is_financial = ticker in banking_tickers
 
                 symbol, sym_created = Symbol.objects.get_or_create(
@@ -48,19 +51,27 @@ class Command(BaseCommand):
                     defaults={
                         "exchange": exchange,
                         "is_financial": is_financial,
-                        "active": True
+                        "is_active": True,
                     }
                 )
 
                 if sym_created:
                     total_symbols_created += 1
-                elif is_financial and not symbol.is_financial:
-                    symbol.is_financial = True
-                    symbol.save()
+                else:
+                    # Keep existing symbols in sync if re-run with updated data
+                    updated_fields = []
+                    if is_financial and not symbol.is_financial:
+                        symbol.is_financial = True
+                        updated_fields.append("is_financial")
+                    if not symbol.is_active:
+                        symbol.is_active = True
+                        updated_fields.append("is_active")
+                    if updated_fields:
+                        symbol.save(update_fields=updated_fields)
 
-                _, mem_created = UniverseMembership.objects.get_or_create(
+                _, mem_created = UniverseMember.objects.get_or_create(
                     universe=universe,
-                    symbol=symbol
+                    symbol=symbol,
                 )
                 if mem_created:
                     total_memberships += 1

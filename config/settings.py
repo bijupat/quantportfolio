@@ -28,10 +28,10 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     
     # Custom Apps
-    'core',
-    'market_data',
-    'forecasting',
-    'portfolio',
+    'core.apps.CoreConfig',
+    'market_data.apps.MarketDataConfig',
+    'forecasting.apps.ForecastingConfig',
+    'portfolio.apps.PortfolioConfig',
 ]
 
 MIDDLEWARE = [
@@ -82,3 +82,5 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 NEWSAPI_KEY = env('NEWSAPI_KEY', default=None)
 
 
+# Custom User Model
+AUTH_USER_MODEL = "core.User"

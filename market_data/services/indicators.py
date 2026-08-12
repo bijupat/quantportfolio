@@ -11,6 +11,29 @@ from market_data.services.prices import dataframe_from_bars
 
 logger = logging.getLogger(__name__)
 
+
+FEATURE_COLUMNS = [
+    "returns_1d", "returns_5d", "returns_20d", "log_return",
+    "hl_ratio", "co_ratio",
+    "close_vs_sma20", "close_vs_sma50", "close_vs_sma100",
+    "rsi_14", "rsi_6", "stoch_rsi",
+    "macd_norm", "macd_hist",
+    "momentum_10", "momentum_20", "momentum_60",
+    "adx", "di_plus", "di_minus",
+    "atr_norm", "bb_width", "bb_pct", "hv_20", "hv_60",
+    "volume_ratio", "obv_signal", "close_vs_vwap",
+    "doji", "bullish_engulf",
+    "day_of_week", "month", "quarter",
+    "sentiment_score", "positive_count", "negative_count", "news_volume",
+]
+
+MARKET_CONTEXT_COLS = [
+    "NSEI_ret1", "NSEI_ret5", "NSEI_ret20",
+    "NSEI_above_sma", "NSEI_vol20", "NSEI_rsi",
+    "BSESN_ret1", "BSESN_ret5", "BSESN_ret20",
+    "BSESN_above_sma", "BSESN_vol20", "BSESN_rsi",
+]
+
 # --- Replicating your original indicator math ---
 
 def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
