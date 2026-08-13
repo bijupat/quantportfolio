@@ -1,0 +1,151 @@
+{% extends "base.html" %}
+{% block title %}Model Training — QuantPortfolioAI{% endblock %}
+{% block content %}
+<h1 class="mb-4">Model Training</h1>
+
+<div class="card shadow-sm mb-4">
+  <div class="card-body">
+    <h5 class="card-title">Train a Standard Transformer</h5>
+    <p class="text-muted small">
+      Trains a QuantTransformer on database-cached OHLCV, indicators, sentiment, and market
+      context, then registers it as a <code>TrainedModel</code>. This can take a while depending
+      on universe size and epochs — the page will keep polling until it finishes.
+    </p>
+
+    <form hx-post="{% url 'forecasting:train_trigger' %}" hx-target="#train-status" hx-swap="innerHTML">
+      {% csrf_token %}
+
+      <div class="row g-3">
+        <div class="col-md-6">
+          <label class="form-label" for="id_model_name">Model name</label>
+          <input type="text" name="model_name" id="id_model_name" class="form-control"
+                 placeholder="e.g. transformer_nifty50_v1" required>
+        </div>
+        <div class="col-md-6">
+          <label class="form-label" for="id_universe">Universe</label>
+          <select name="universe" id="id_universe" class="form-select" required>
+            <option value="" disabled selected>Select a universe…</option>
+            {% for u in universes %}
+              <option value="{{ u.name }}">{{ u.name }}</option>
+            {% endfor %}
+          </select>
+          {% if not universes %}
+            <div class="form-text text-warning">
+              No universes seeded yet — visit <a href="{% url 'market_data:fetch' %}">Data Pipeline</a> first.
+            </div>
+          {% endif %}
+        </div>
+
+        <div class="col-md-4">
+          <label class="form-label" for="id_start">Start date</label>
+          <input type="date" name="start" id="id_start" class="form-control" value="2015-01-01">
+        </div>
+        <div class="col-md-4">
+          <label class="form-label" for="id_end">End date <span class="text-muted">(optional)</span></label>
+          <input type="date" name="end" id="id_end" class="form-control">
+        </div>
+        <div class="col-md-4">
+          <label class="form-label" for="id_epochs">Epochs</label>
+          <input type="number" name="epochs" id="id_epochs" class="form-control" value="50" min="1">
+        </div>
+
+        <div class="col-md-4 form-check form-switch mt-4">
+          <input class="form-check-input" type="checkbox" name="use_sentiment" id="id_use_sentiment" checked>
+          <label class="form-check-label" for="id_use_sentiment">Use news sentiment features</label>
+        </div>
+      </div>
+
+      <details class="mt-3">
+        <summary class="text-muted" style="cursor: pointer;">Advanced architecture settings</summary>
+        <div class="row g-3 mt-1">
+          <div class="col-md-3">
+            <label class="form-label" for="id_batch_size">Batch size</label>
+            <input type="number" name="batch_size" id="id_batch_size" class="form-control" value="64" min="1">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label" for="id_seq_len">Sequence length</label>
+            <input type="number" name="seq_len" id="id_seq_len" class="form-control" value="60" min="1">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label" for="id_horizon">Horizon (days)</label>
+            <input type="number" name="horizon" id="id_horizon" class="form-control" value="30" min="1">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label" for="id_d_model">d_model</label>
+            <input type="number" name="d_model" id="id_d_model" class="form-control" value="64" min="1">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label" for="id_n_heads">Attention heads</label>
+            <input type="number" name="n_heads" id="id_n_heads" class="form-control" value="4" min="1">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label" for="id_n_layers">Encoder layers</label>
+            <input type="number" name="n_layers" id="id_n_layers" class="form-control" value="2" min="1">
+          </div>
+        </div>
+      </details>
+
+      <button type="submit" class="btn btn-primary mt-3" {% if not universes %}disabled{% endif %}>
+        Start Training
+      </button>
+    </form>
+
+    <div id="train-status" class="mt-3"></div>
+  </div>
+</div>
+
+<div class="card shadow-sm mb-4 border-secondary-subtle">
+  <div class="card-body">
+    <h5 class="card-title text-muted">Train a Hybrid Model</h5>
+    <p class="text-muted small mb-0">
+      Not wired up yet — <code>train_hybrid_model.py</code> needs to be re-uploaded so its
+      actual CLI arguments can be mirrored here instead of guessed.
+    </p>
+  </div>
+</div>
+
+<h5>Registered Models</h5>
+<table class="table table-sm align-middle">
+  <thead>
+    <tr><th>Name</th><th>Type</th><th>seq_len</th><th>d_model</th><th>Universe</th><th>Created</th></tr>
+  </thead>
+  <tbody>
+    {% for m in trained_models %}
+    <tr>
+      <td><code>{{ m.name }}</code></td>
+      <td>{{ m.get_model_type_display }}</td>
+      <td>{{ m.seq_len }}</td>
+      <td>{{ m.d_model }}</td>
+      <td>{{ m.trained_on|default:"—" }}</td>
+      <td>{{ m.created_at }}</td>
+    </tr>
+    {% empty %}
+    <tr><td colspan="6" class="text-muted">No models trained yet.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h5 class="mt-4">Recent Training Jobs</h5>
+<table class="table table-sm align-middle">
+  <thead>
+    <tr><th>Command</th><th>Status</th><th>Started</th><th>Finished</th><th>By</th></tr>
+  </thead>
+  <tbody>
+    {% for job in recent_jobs %}
+    <tr>
+      <td><code>{{ job.command_name }}</code> — {{ job.options.model_name }}</td>
+      <td>
+        <span class="badge {% if job.status == 'success' %}bg-success{% elif job.status == 'failed' %}bg-danger{% elif job.status == 'running' %}bg-info{% else %}bg-secondary{% endif %}">
+          {{ job.get_status_display }}
+        </span>
+      </td>
+      <td>{{ job.started_at|default:"—" }}</td>
+      <td>{{ job.finished_at|default:"—" }}</td>
+      <td>{{ job.triggered_by|default:"—" }}</td>
+    </tr>
+    {% empty %}
+    <tr><td colspan="5" class="text-muted">No jobs run yet.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

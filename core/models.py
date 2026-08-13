@@ -67,3 +67,40 @@ class UniverseMember(models.Model):
 
     def __str__(self) -> str:
         return f"{self.symbol.ticker} in {self.universe.name}"
+
+class JobRun(models.Model):
+    """Tracks a management command triggered asynchronously from the web UI.
+
+    Lets an HTMX polling view report progress/output for long-running jobs
+    (fetch_prices, seed_universes, train_model, run_composite) that would
+    otherwise block the request thread that triggered them.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        RUNNING = "running", "Running"
+        SUCCESS = "success", "Success"
+        FAILED = "failed", "Failed"
+
+    command_name = models.CharField(max_length=100)
+    options = models.JSONField(default=dict, blank=True)
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    output = models.TextField(blank=True)
+    error = models.TextField(blank=True)
+    triggered_by = models.ForeignKey(
+        "core.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="job_runs"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.command_name} [{self.status}] #{self.pk}"
+
+    @property
+    def is_finished(self) -> bool:
+        """Returns True once the job has reached a terminal (success/failed) state."""
+        return self.status in (self.Status.SUCCESS, self.Status.FAILED)
