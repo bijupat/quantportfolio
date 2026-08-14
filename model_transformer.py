@@ -184,7 +184,222 @@ class QuantTransformer(keras.Model):
         pooled, pool_weights = self.pool(x)
         out = self.head(pooled, training=training)
         return tf.squeeze(out, axis=-1)
+# ─────────────────────────────────────────────
+# Triple-Branch Hybrid Model
+# Relocated from hybrid_main.py — fuses time-series, financial, and
+# sentiment streams into a single wide-tensor-compatible model so it
+# stays drop-in loadable by build_keras_model() / predictor.py.
+# ─────────────────────────────────────────────
+class TripleBranchHybridModel(keras.Model):
+    """
+    Triple-branch deep learning model for stock return prediction.
 
+    Accepts a SINGLE wide tensor (batch, seq_len, n_total_features) where
+    n_total_features = n_ts_features + n_financial_features + n_sentiment_features.
+    Internally slices into three branches, processes each with a specialised
+    sub-network, fuses the embeddings, and regresses to a scalar return.
+    """
+
+    def __init__(
+        self,
+        seq_len:              int   = 120,
+        n_ts_features:        int   = 50,
+        n_financial_features: int   = 8,
+        n_sentiment_features: int   = 4,
+        d_model:              int   = 64,
+        n_heads:              int   = 4,
+        n_layers:              int  = 2,
+        lstm_units:           int   = 64,
+        dropout:              float = 0.15,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        self.seq_len              = seq_len
+        self.n_ts_features        = n_ts_features
+        self.n_financial_features = n_financial_features
+        self.n_sentiment_features = n_sentiment_features
+        self.n_features           = n_ts_features + n_financial_features + n_sentiment_features
+        self.d_model              = d_model
+        self.n_heads              = n_heads
+        self.n_layers             = n_layers
+        self.lstm_units           = lstm_units
+
+        # ── Branch 1: Time-Series (LSTM) ──────────────────────
+        self.ts_lstm   = layers.LSTM(lstm_units, return_sequences=False, dropout=dropout)
+        self.ts_norm   = layers.LayerNormalization(epsilon=1e-6)
+        self.ts_dense  = layers.Dense(d_model, activation="gelu")
+        self.ts_drop   = layers.Dropout(dropout)
+
+        # ── Branch 2: Financial (Dense MLP) ───────────────────
+        self.fin_dense1 = layers.Dense(32, activation="gelu")
+        self.fin_norm1  = layers.LayerNormalization(epsilon=1e-6)
+        self.fin_drop1  = layers.Dropout(dropout)
+        self.fin_dense2 = layers.Dense(d_model, activation="gelu")
+        self.fin_drop2  = layers.Dropout(dropout)
+
+        # ── Branch 3: Sentiment (Transformer Encoder) ─────────
+        self.sent_proj   = layers.Dense(d_model, use_bias=False)
+        self.sent_norm_i = layers.LayerNormalization(epsilon=1e-6)
+        self.sent_attn   = layers.MultiHeadAttention(
+            num_heads = max(1, n_heads // 2),
+            key_dim   = max(1, d_model // max(1, n_heads // 2)),
+        )
+        self.sent_ffn    = keras.Sequential([
+            layers.Dense(d_model * 2, activation="gelu"),
+            layers.Dropout(dropout),
+            layers.Dense(d_model),
+        ])
+        self.sent_norm1  = layers.LayerNormalization(epsilon=1e-6)
+        self.sent_norm2  = layers.LayerNormalization(epsilon=1e-6)
+        self.sent_drop   = layers.Dropout(dropout)
+        self.sent_pool_q = layers.Dense(1)
+        self.sent_drop2  = layers.Dropout(dropout)
+
+        # ── Fusion layer ───────────────────────────────────────
+        self.fusion_dense1 = layers.Dense(d_model * 2, activation="gelu")
+        self.fusion_norm   = layers.LayerNormalization(epsilon=1e-6)
+        self.fusion_drop   = layers.Dropout(dropout)
+        self.fusion_dense2 = layers.Dense(d_model, activation="gelu")
+
+        # ── Regression head ────────────────────────────────────
+        self.head = keras.Sequential([
+            layers.Dense(64, activation="gelu"),
+            layers.Dropout(dropout * 0.5),
+            layers.Dense(1, activation="linear"),
+        ])
+
+        self._last_attn_weights = None
+
+    def call(self, x, training=False):
+        """Forward pass: slices x into [ts | financial | sentiment] branches."""
+        n_ts   = self.n_ts_features
+        n_fin  = self.n_financial_features
+        n_sent = self.n_sentiment_features
+
+        x_ts   = x[:, :, :n_ts]
+        x_fin  = x[:, 0, n_ts:n_ts + n_fin]
+        x_sent = x[:, :, n_ts + n_fin:]
+
+        ts_out = self.ts_lstm(x_ts, training=training)
+        ts_out = self.ts_norm(ts_out)
+        ts_emb = self.ts_drop(self.ts_dense(ts_out), training=training)
+
+        fin_out = self.fin_dense1(x_fin)
+        fin_out = self.fin_norm1(fin_out)
+        fin_out = self.fin_drop1(fin_out, training=training)
+        fin_emb = self.fin_drop2(self.fin_dense2(fin_out), training=training)
+
+        s = self.sent_proj(x_sent)
+        s = self.sent_norm_i(s)
+        s_norm  = self.sent_norm1(s)
+        s_attn, attn_w = self.sent_attn(
+            s_norm, s_norm, return_attention_scores=True, training=training
+        )
+        s = s + self.sent_drop(s_attn, training=training)
+        s_norm = self.sent_norm2(s)
+        s = s + self.sent_ffn(s_norm, training=training)
+        self._last_attn_weights = [attn_w]
+
+        scores  = self.sent_pool_q(s)
+        weights = tf.nn.softmax(scores, axis=1)
+        sent_emb = tf.reduce_sum(s * weights, axis=1)
+        sent_emb = self.sent_drop2(sent_emb, training=training)
+
+        fused = tf.concat([ts_emb, fin_emb, sent_emb], axis=-1)
+        fused = self.fusion_norm(self.fusion_dense1(fused))
+        fused = self.fusion_drop(fused, training=training)
+        fused = self.fusion_dense2(fused)
+
+        out = self.head(fused, training=training)
+        return tf.squeeze(out, axis=-1)
+
+
+def build_hybrid_model(
+    seq_len:              int   = 120,
+    n_ts_features:        int   = 50,
+    n_financial_features: int   = 8,
+    n_sentiment_features: int   = 4,
+    d_model:              int   = 64,
+    n_heads:              int   = 4,
+    n_layers:             int   = 2,
+    lstm_units:           int   = 64,
+    dropout:              float = 0.15,
+    lr:                   float = 1e-4,
+) -> TripleBranchHybridModel:
+    """Build, compile, and warm-up the triple-branch model."""
+    model = TripleBranchHybridModel(
+        seq_len=seq_len, n_ts_features=n_ts_features,
+        n_financial_features=n_financial_features,
+        n_sentiment_features=n_sentiment_features,
+        d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+        lstm_units=lstm_units, dropout=dropout,
+    )
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=lr, clipnorm=1.0),
+        loss="huber", metrics=["mae"],
+    )
+    n_total = n_ts_features + n_financial_features + n_sentiment_features
+    dummy = tf.zeros((1, seq_len, n_total))
+    model(dummy, training=False)
+    log.info(
+        f"TripleBranchHybridModel built: ts={n_ts_features}  fin={n_financial_features}  "
+        f"sent={n_sentiment_features}  total_features={n_total}  params={model.count_params():,}"
+    )
+    return model
+
+
+def train_hybrid_model(
+    model:       TripleBranchHybridModel,
+    X_train:     np.ndarray,
+    y_train:     np.ndarray,
+    X_val:       np.ndarray,
+    y_val:       np.ndarray,
+    model_name:  str,
+    epochs:      int = 60,
+    batch_size:  int = 32,
+    patience:    int = 12,
+) -> keras.callbacks.History:
+    """Train the hybrid model with early stopping and LR reduction."""
+    tmp_path = MODELS_DIR / f"{model_name}_tmp_best.weights.h5"
+
+    class _LogCB(keras.callbacks.Callback):
+        def on_epoch_end(self, epoch, logs=None):
+            if (epoch + 1) % 5 == 0:
+                logs = logs or {}
+                log.info(
+                    f"  Epoch {epoch+1:3d}  loss={logs.get('loss', 0):.5f}  "
+                    f"mae={logs.get('mae', 0):.5f}  val_loss={logs.get('val_loss', 0):.5f}  "
+                    f"val_mae={logs.get('val_mae', 0):.5f}"
+                )
+
+    callbacks = [
+        keras.callbacks.EarlyStopping(monitor="val_mae", patience=patience,
+                                       restore_best_weights=True, verbose=1),
+        keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=6,
+                                           min_lr=1e-6, verbose=1),
+        keras.callbacks.ModelCheckpoint(str(tmp_path), monitor="val_mae",
+                                         save_best_only=True, save_weights_only=True, verbose=0),
+        keras.callbacks.TerminateOnNaN(),
+        _LogCB(),
+    ]
+
+    log.info(
+        f"Training '{model_name}'  Train={X_train.shape[0]:,}  Val={X_val.shape[0]:,}  "
+        f"Features={X_train.shape[2]}  Epochs={epochs}  BS={batch_size}"
+    )
+
+    history = model.fit(
+        X_train, y_train, validation_data=(X_val, y_val),
+        epochs=epochs, batch_size=batch_size, callbacks=callbacks, verbose=0,
+    )
+
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    best_val = min(history.history.get("val_mae", [999]))
+    log.info(f"Training complete.  Best val_mae = {best_val:.5f}")
+    return history
 
 # ─────────────────────────────────────────────
 # Build & compile
@@ -511,12 +726,7 @@ def load_model(name: str = "transformer_model"):
 
     # ── Build correct model class ─────────────────────────────
     if model_type == "triple_branch_hybrid":
-        # Import TripleBranchHybridModel from composite_main.py
-        # (lazy import to avoid circular dependency at module load)
         try:
-            from composite_main import (
-                TripleBranchHybridModel, build_hybrid_model,
-            )
             model = build_hybrid_model(
                 seq_len              = arch["seq_len"],
                 n_ts_features        = arch.get("n_ts_features",
@@ -533,7 +743,7 @@ def load_model(name: str = "transformer_model"):
             )
         except ImportError:
             log.warning(
-                "composite_main.py not found — falling back to QuantTransformer. "
+                "TripleBranchHybridModel not built !!."
                 "Prediction may be inaccurate if model was trained as hybrid."
             )
             model = build_transformer_model(

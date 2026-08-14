@@ -94,13 +94,85 @@
   </div>
 </div>
 
-<div class="card shadow-sm mb-4 border-secondary-subtle">
+<div class="card shadow-sm mb-4">
   <div class="card-body">
-    <h5 class="card-title text-muted">Train a Hybrid Model</h5>
-    <p class="text-muted small mb-0">
-      Not wired up yet — <code>train_hybrid_model.py</code> needs to be re-uploaded so its
-      actual CLI arguments can be mirrored here instead of guessed.
+    <h5 class="card-title">Train a Hybrid Model</h5>
+    <p class="text-muted small">
+      Trains the TripleBranchHybridModel (time-series + financial + sentiment branches) and
+      registers it as a <code>TrainedModel</code> of type "TripleBranchHybridModel".
     </p>
+
+    <form hx-post="{% url 'forecasting:train_hybrid_trigger' %}" hx-target="#train-hybrid-status" hx-swap="innerHTML">
+      {% csrf_token %}
+      <div class="row g-3">
+        <div class="col-md-6">
+          <label class="form-label" for="id_hybrid_model_name">Model name</label>
+          <input type="text" name="model_name" id="id_hybrid_model_name" class="form-control"
+                 placeholder="e.g. hybrid_nifty50_v1" required>
+        </div>
+        <div class="col-md-6">
+          <label class="form-label" for="id_hybrid_universe">Universe</label>
+          <select name="universe" id="id_hybrid_universe" class="form-select" required>
+            <option value="" disabled selected>Select a universe…</option>
+            {% for u in universes %}
+              <option value="{{ u.name }}">{{ u.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-md-4">
+          <label class="form-label" for="id_hybrid_start">Start date</label>
+          <input type="date" name="start" id="id_hybrid_start" class="form-control" value="2015-01-01">
+        </div>
+        <div class="col-md-4">
+          <label class="form-label" for="id_hybrid_end">End date <span class="text-muted">(optional)</span></label>
+          <input type="date" name="end" id="id_hybrid_end" class="form-control">
+        </div>
+        <div class="col-md-4">
+          <label class="form-label" for="id_hybrid_epochs">Epochs</label>
+          <input type="number" name="epochs" id="id_hybrid_epochs" class="form-control" value="60" min="1">
+        </div>
+        <div class="col-md-4 form-check form-switch mt-4">
+          <input class="form-check-input" type="checkbox" name="use_sentiment" id="id_hybrid_use_sentiment" checked>
+          <label class="form-check-label" for="id_hybrid_use_sentiment">Use news sentiment branch</label>
+        </div>
+      </div>
+
+      <details class="mt-3">
+        <summary class="text-muted" style="cursor: pointer;">Advanced architecture settings</summary>
+        <div class="row g-3 mt-1">
+          <div class="col-md-3">
+            <label class="form-label" for="id_hybrid_batch_size">Batch size</label>
+            <input type="number" name="batch_size" id="id_hybrid_batch_size" class="form-control" value="32" min="1">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label" for="id_hybrid_seq_len">Sequence length</label>
+            <input type="number" name="seq_len" id="id_hybrid_seq_len" class="form-control" value="120" min="1">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label" for="id_hybrid_d_model">d_model</label>
+            <input type="number" name="d_model" id="id_hybrid_d_model" class="form-control" value="64" min="1">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label" for="id_hybrid_n_heads">Attention heads</label>
+            <input type="number" name="n_heads" id="id_hybrid_n_heads" class="form-control" value="4" min="1">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label" for="id_hybrid_n_layers">Encoder layers</label>
+            <input type="number" name="n_layers" id="id_hybrid_n_layers" class="form-control" value="2" min="1">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label" for="id_hybrid_lstm_units">LSTM units</label>
+            <input type="number" name="lstm_units" id="id_hybrid_lstm_units" class="form-control" value="64" min="1">
+          </div>
+        </div>
+      </details>
+
+      <button type="submit" class="btn btn-primary mt-3" {% if not universes %}disabled{% endif %}>
+        Start Hybrid Training
+      </button>
+    </form>
+
+    <div id="train-hybrid-status" class="mt-3"></div>
   </div>
 </div>
 

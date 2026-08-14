@@ -20,15 +20,18 @@ from market_data.services.sentiment import get_sentiment
 from market_data.services.quality import get_quality_scores_bulk
 from market_data.services.market_context import get_market_context
 
-# Import neural network models from root CLI files
 from model_transformer import (
     build_transformer_model,
     train_model as keras_train_model,
     evaluate_model as keras_evaluate_model,
+    build_hybrid_model,
+    train_hybrid_model as keras_train_hybrid,
 )
 
 from portfolio_optimizer import walk_forward_splits
-from market_data.services.indicators import FEATURE_COLUMNS, MARKET_CONTEXT_COLS
+from market_data.services.indicators import (
+    FEATURE_COLUMNS, MARKET_CONTEXT_COLS, FINANCIAL_FEATURES, SENTIMENT_FEATURES,
+)
 from util import clip_outliers, build_sequences
 
 logger = logging.getLogger(__name__)

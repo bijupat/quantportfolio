@@ -43,17 +43,15 @@ class Command(BaseCommand):
             total_universes += 1
 
             for ticker in tickers:
-                exchange = Symbol.BSE if ticker.endswith(".BO") else Symbol.NSE
                 is_financial = ticker in banking_tickers
 
                 symbol, sym_created = Symbol.objects.get_or_create(
                     ticker=ticker,
                     defaults={
-                        "exchange": exchange,
-                        "is_financial": is_financial,
-                        "is_active": True,
-                    }
-                )
+                                "is_financial": is_financial,
+                                "is_active": True,
+                                }
+    )
 
                 if sym_created:
                     total_symbols_created += 1

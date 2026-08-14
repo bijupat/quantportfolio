@@ -39,13 +39,35 @@ class User(AbstractUser):
 
 
 class Symbol(models.Model):
-    ticker = models.CharField(max_length=20, unique=True)
-    name = models.CharField(max_length=100, blank=True, null=True)
-    sector = models.CharField(max_length=50, blank=True, null=True)
-    is_active = models.BooleanField(default=True)
+    """A tradeable NSE/BSE equity.
+
+    ``exchange`` is intentionally NOT a stored column — it's fully
+    determined by the ticker's '.NS' / '.BO' suffix (the app's existing
+    convention, e.g. 'RELIANCE.NS' vs 'RELIANCE.BO'). Storing it as a
+    separate field would create a second source of truth that could
+    drift from the ticker itself, so it's derived on access instead.
+    """
+
+    NSE = "NSE"
+    BSE = "BSE"
+
+    ticker: str = models.CharField(max_length=20, unique=True)
+    name: str = models.CharField(max_length=100, blank=True, null=True)
+    sector: str = models.CharField(max_length=50, blank=True, null=True)
+    is_financial: bool = models.BooleanField(
+        default=False,
+        help_text="True for banks/NBFCs/insurers — used to exclude Altman "
+                   "Z-Score and flag Piotroski interpretation caveats.",
+    )
+    is_active: bool = models.BooleanField(default=True)
 
     def __str__(self) -> str:
         return self.ticker
+
+    @property
+    def exchange(self) -> str:
+        """Derived from the ticker suffix: '.BO' -> BSE, everything else -> NSE."""
+        return self.BSE if self.ticker.endswith(".BO") else self.NSE
 
 
 class Universe(models.Model):

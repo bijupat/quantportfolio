@@ -53,7 +53,7 @@ def get_market_context(index_ticker: str, start: date, end: date) -> QuerySet[Ma
         logger.info(f"Computing missing market context for {index_ticker}")
         
         # 2. Get the index symbol and its prices
-        symbol, _ = Symbol.objects.get_or_create(ticker=index_ticker, defaults={"exchange": "NSE"})
+        symbol, _ = Symbol.objects.get_or_create(ticker=index_ticker)
         
         # Fetching well before the start date to allow rolling windows (e.g. 20 days) to warm up
         warmup_start = start - pd.Timedelta(days=40)

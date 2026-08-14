@@ -96,8 +96,7 @@ class TrainedModel(models.Model):
         """
         Instantiates the uncompiled Keras architecture and loads the weights.
         """
-        from model_transformer import build_transformer_model, _load_weights_shape_matched
-        from hybrid_main import build_hybrid_model
+        from model_transformer import build_transformer_model, build_hybrid_model, _load_weights_shape_matched
 
         if self.model_type == self.HYBRID:
             model = build_hybrid_model(

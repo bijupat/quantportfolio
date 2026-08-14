@@ -33,7 +33,20 @@ MARKET_CONTEXT_COLS = [
     "BSESN_ret1", "BSESN_ret5", "BSESN_ret20",
     "BSESN_above_sma", "BSESN_vol20", "BSESN_rsi",
 ]
+FINANCIAL_FEATURES = [
+    "returnOnEquity",        # ROE
+    "returnOnAssets",        # ROA
+    "trailingPE",            # P/E ratio
+    "revenueGrowth",         # Revenue growth YoY
+    "debtToEquity",          # Debt/Equity ratio
+    "freeCashflow_norm",     # Free cash flow / market cap (normalised)
+    "piotroski_score_norm",  # Piotroski F-Score / 9
+    "altman_z_norm",         # min(Altman Z / 5, 1.0) — 0 for financial stocks
+]
 
+SENTIMENT_FEATURES = [
+    "sentiment_score", "positive_count", "negative_count", "news_volume",
+]
 # --- Replicating your original indicator math ---
 
 def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
