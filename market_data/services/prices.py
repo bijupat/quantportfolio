@@ -127,3 +127,33 @@ def dataframe_from_bars(queryset: QuerySet[PriceBar]) -> pd.DataFrame:
         df[col] = df[col].astype(float)
         
     return df
+
+def backfill_symbol_metadata(symbol: Symbol) -> bool:
+    """Fetches and saves name/sector for a Symbol from yfinance if missing.
+
+    Args:
+        symbol: The Symbol instance to backfill. Mutated and saved in place.
+
+    Returns:
+        True if metadata was fetched and saved this call, False if it was
+        already populated or the yfinance fetch failed/returned nothing.
+    """
+    if symbol.name and symbol.sector:
+        return False
+
+    yf_ticker = symbol.ticker if symbol.ticker.endswith((".NS", ".BO")) else f"{symbol.ticker}.NS"
+
+    try:
+        info = yf.Ticker(yf_ticker).info
+    except Exception as e:
+        logger.warning(f"yfinance .info fetch failed for {symbol.ticker}: {e}")
+        return False
+
+    if not info:
+        logger.warning(f"yfinance returned empty metadata for {symbol.ticker}")
+        return False
+
+    symbol.name = symbol.name or info.get("longName") or info.get("shortName") or symbol.ticker
+    symbol.sector = symbol.sector or info.get("sector") or "Unknown"
+    symbol.save(update_fields=["name", "sector"])
+    return True

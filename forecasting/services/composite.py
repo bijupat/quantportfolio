@@ -1,12 +1,17 @@
+import hashlib
+import json
 import logging
 import numpy as np
 import pandas as pd
-from datetime import datetime,date
+from datetime import datetime, date
 from typing import Dict, List, Optional
+
+from django.db.models import QuerySet
 
 from core.models import Symbol
 from market_data.services.prices import get_price_bars, dataframe_from_bars
 from market_data.services.quality import get_quality_scores_bulk
+from forecasting.models import CompositeScore
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +107,74 @@ def compute_composite_scores(
         
     return results
 
+
+def compute_config_hash(
+    model_names: List[str],
+    model_weights: List[float],
+    weights_config: Dict[str, float],
+    use_sentiment: bool,
+) -> str:
+    """Derives a stable short hash identifying a composite scoring configuration.
+
+    Only inputs that change the *scores themselves* are included — model
+    selection/weights, layer weights, and the sentiment flag. Portfolio
+    construction params (universe, top_n, amount) are deliberately excluded:
+    they change which stocks get bought, not how any given stock is scored,
+    so two runs differing only in --top-n should share the same config_hash
+    and update the same CompositeScore rows rather than fork into duplicates.
+    """
+    payload = {
+        "models": sorted(zip(model_names, model_weights)),
+        "weights_config": {k: round(v, 6) for k, v in sorted(weights_config.items())},
+        "use_sentiment": use_sentiment,
+    }
+    raw = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def save_composite_scores_to_db(
+    composite_results: Dict[str, Dict],
+    tiers: Dict[str, str],
+    as_of_date: date,
+    config_hash: str,
+) -> QuerySet[CompositeScore]:
+    """Persists composite scoring results as CompositeScore rows.
+
+    Existing rows for this (as_of_date, config_hash) pair are cleared first,
+    so re-running an identical config on the same date replaces rather than
+    conflicting with (or duplicating) prior results — same idempotent-rerun
+    pattern as portfolio_service.save_portfolio_to_db.
+    """
+    CompositeScore.objects.filter(as_of_date=as_of_date, config_hash=config_hash).delete()
+
+    tickers = list(composite_results.keys())
+    symbol_map = {s.ticker: s for s in Symbol.objects.filter(ticker__in=tickers)}
+
+    rows_to_create = []
+    for ticker, d in composite_results.items():
+        symbol = symbol_map.get(ticker)
+        if symbol is None:
+            logger.warning(f"Symbol {ticker} not found in database. Skipping CompositeScore.")
+            continue
+        rows_to_create.append(
+            CompositeScore(
+                symbol=symbol,
+                as_of_date=as_of_date,
+                config_hash=config_hash,
+                composite_score=d["composite_score"],
+                transformer_score=d["transformer_score"],
+                transformer_norm=d["transformer_norm"],
+                quality_score=d["quality_score"],
+                technical_score=d["technical_score"],
+                per_model_scores=d.get("per_model_scores", {}),
+                tier=tiers.get(ticker, "AVOID"),
+            )
+        )
+
+    if rows_to_create:
+        CompositeScore.objects.bulk_create(rows_to_create)
+
+    return CompositeScore.objects.filter(as_of_date=as_of_date, config_hash=config_hash)
 
 def build_composite_portfolio(
     composite_results: dict,

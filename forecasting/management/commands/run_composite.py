@@ -4,10 +4,14 @@ from core.models import Symbol, Universe
 from market_data.models import TrainedModel
 from portfolio.services.portfolio_service import save_portfolio_to_db
 from forecasting.services.ensemble import run_ensemble_layer
-from forecasting.services.composite import compute_composite_scores
+from forecasting.services.composite import (
+    compute_composite_scores,
+    build_composite_portfolio,
+    compute_config_hash,
+    save_composite_scores_to_db,
+)
 from forecasting.services.reports import save_portfolio_report_pdf, save_score_breakdown_excel
 from portfolio_optimizer import rank_stocks, score_to_ranking_table, construct_portfolio
-from portfolio.services.portfolio_service import save_portfolio_to_db
 class Command(BaseCommand):
     help = "Runs composite/ensemble scoring over a universe of stocks."
 
@@ -84,9 +88,35 @@ class Command(BaseCommand):
         ranking_df = score_to_ranking_table(comp_scores_flat)
         tiers = rank_stocks(comp_scores_flat, top_n=options['top_n'], hold_n=15)
         portfolio_weights = construct_portfolio(comp_scores_flat, top_n=options['top_n'], weighting="score")
+
+        # 3b. Persist composite scores for this run. config_hash identifies the
+        # scoring config so an identical re-run on the same as_of_date replaces
+        # these rows instead of erroring on the unique_together constraint.
+        config_hash = compute_config_hash(
+            model_names=model_names,
+            model_weights=weights,
+            weights_config=weights_config,
+            use_sentiment=not options['no_sentiment'],
+        )
+        composite_score_rows = list(save_composite_scores_to_db(
+            composite_results=composite_results,
+            tiers=tiers,
+            as_of_date=as_of_date,
+            config_hash=config_hash,
+        ))
+
+        # ReportArtifact.composite_run is a single FK, but CompositeScore is per-symbol —
+        # link to the top-ranked symbol's row as a stand-in for "this run". The full
+        # run is still queryable via CompositeScore.objects.filter(as_of_date=..., config_hash=...).
+        representative_score = None
+        if not ranking_df.empty:
+            top_symbol = ranking_df.index[0]
+            representative_score = next(
+                (r for r in composite_score_rows if r.symbol.ticker == top_symbol), None
+            )
+
         
         # Build structured holdings for Excel export
-        from forecasting.services.composite import build_composite_portfolio
         portfolio_holdings = build_composite_portfolio(
             composite_results=composite_results,
             top_n=options['top_n'],
@@ -121,7 +151,9 @@ class Command(BaseCommand):
                 ranking_df=ranking_df,
                 weights=portfolio_weights,
                 tiers=tiers,
-                model_name=f"Composite ({(', '.join(model_names))[:15]}...)"
+                model_name=f"Composite ({(', '.join(model_names))[:15]}...)",
+                portfolio=saved_portfolio,
+                composite_run=representative_score,
             )
             self.stdout.write(self.style.SUCCESS(f"PDF Report Saved: {pdf_artifact.file.name}"))
 
@@ -132,7 +164,9 @@ class Command(BaseCommand):
                 model_names=model_names,
                 model_weights=weights,
                 weights_used=weights_config,
-                portfolio_amount=options['amount']
+                portfolio_amount=options['amount'],
+                portfolio=saved_portfolio,
+                composite_run=representative_score,
             )
             if xlsx_artifact:
                 self.stdout.write(self.style.SUCCESS(f"Excel Score Breakdown Saved: {xlsx_artifact.file.name}"))

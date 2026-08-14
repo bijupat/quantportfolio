@@ -7,3 +7,4 @@ news_cache/
 media/charts/
 media/reports/
 data_cache/
+db.sqlite3

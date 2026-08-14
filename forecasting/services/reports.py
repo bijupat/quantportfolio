@@ -15,8 +15,17 @@ def save_portfolio_report_pdf(
     metrics: dict = None,
     raw_scores: dict = None,
     model_name: str = "Unknown",
+    portfolio=None,
+    composite_run=None,
 ) -> ReportArtifact:
-    """Generates a styled PDF report for the portfolio and saves it as a ReportArtifact."""
+    """Generates a styled PDF report for the portfolio and saves it as a ReportArtifact.
+
+    Args:
+        portfolio: The portfolio.models.Portfolio this report was generated for, if any.
+        composite_run: A representative forecasting.models.CompositeScore row for this
+            run (see save_composite_scores_to_db) — links the artifact back to the
+            scoring config/date it came from, if any.
+    """
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib import colors
@@ -99,8 +108,9 @@ def save_portfolio_report_pdf(
         story.append(ranking_tbl)
         
         doc.build(story, onFirstPage=page_tmpl, onLaterPages=page_tmpl)
-
-    artifact = ReportArtifact.objects.create(kind=ReportArtifact.PDF)
+    artifact = ReportArtifact.objects.create(
+        kind=ReportArtifact.PDF, portfolio=portfolio, composite_run=composite_run
+    )
     now_str = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     with open(tmp.name, 'rb') as f:
         artifact.file.save(f"{now_str}_portfolio_report.pdf", File(f))
@@ -116,10 +126,17 @@ def save_score_breakdown_excel(
     model_weights: list,
     weights_used: dict,
     portfolio_amount: float,
+    portfolio=None,
+    composite_run=None,
 ) -> ReportArtifact:
     """
     Generates the multi-sheet Score Breakdown and Portfolio Excel workbook
     and saves it as a ReportArtifact.
+
+    Args:
+        portfolio: The portfolio.models.Portfolio this report was generated for, if any.
+        composite_run: A representative forecasting.models.CompositeScore row for this
+            run, if any.
     """
     try:
         from openpyxl import Workbook
@@ -300,8 +317,9 @@ def save_score_breakdown_excel(
 
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
         wb.save(tmp.name)
-
-    artifact = ReportArtifact.objects.create(kind=ReportArtifact.XLSX)
+    artifact = ReportArtifact.objects.create(
+        kind=ReportArtifact.XLSX, portfolio=portfolio, composite_run=composite_run
+    )
     now_ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     with open(tmp.name, 'rb') as f:
         artifact.file.save(f"{now_ts}_score_breakdown.xlsx", File(f))

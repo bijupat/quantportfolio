@@ -5,7 +5,7 @@ import yfinance as yf
 from django.core.management.base import BaseCommand, CommandError
 
 from core.models import Symbol, Universe
-from market_data.services.prices import get_price_bars
+from market_data.services.prices import get_price_bars, backfill_symbol_metadata
 
 
 class Command(BaseCommand):
@@ -56,14 +56,10 @@ class Command(BaseCommand):
             yf_ticker = ticker if ticker.endswith(('.NS', '.BO')) else f"{ticker}.NS"
 
             # Backfill name/sector if missing (seed_universes doesn't set these)
-            if not symbol_obj.name or not symbol_obj.sector:
-                try:
-                    info = yf.Ticker(yf_ticker).info
-                    symbol_obj.name = symbol_obj.name or info.get('longName') or info.get('shortName', ticker)
-                    symbol_obj.sector = symbol_obj.sector or info.get('sector', 'Unknown')
-                    symbol_obj.save(update_fields=['name', 'sector'])
-                except Exception as e:
-                    self.stdout.write(self.style.WARNING(f"  Could not fetch metadata for {ticker}: {e}"))
+            if backfill_symbol_metadata(symbol_obj):
+                self.stdout.write(f"  Backfilled metadata for {ticker}: {symbol_obj.name} ({symbol_obj.sector})")
+            elif not symbol_obj.name or not symbol_obj.sector:
+                self.stdout.write(self.style.WARNING(f"  Could not backfill metadata for {ticker} — check logs"))
 
             self.stdout.write(f"  Syncing price bars for {ticker}...")
             get_price_bars(symbol=symbol_obj, start=start_date, end=end_date)
