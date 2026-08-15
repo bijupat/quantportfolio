@@ -8,5 +8,5 @@ app_name = "portfolio"
 
 urlpatterns = [
     path("", views.PortfolioListView.as_view(), name="list"),
-    path("<int:pk>/", views.PortfolioDetailView.as_view(), name="detail"),
+    path("<str:name>/", views.PortfolioDetailView.as_view(), name="detail"),
 ]

@@ -1,10 +1,12 @@
-{% extends "base.html" %}
-{% block title %}Portfolios — QuantPortfolioAI{% endblock %}
+{% extends "base.html" %} 
+{% block title %}Portfolios — QuantPortfolioAI {% endblock %} 
 {% block content %}
 <h1 class="mb-4">Portfolios</h1>
 
 {% if not user.is_admin_role %}
-<p class="text-muted small">Showing your portfolios and system-generated ones.</p>
+<p class="text-muted small">
+  Showing your portfolios and system-generated ones.
+</p>
 {% endif %}
 
 <table class="table table-sm align-middle">
@@ -24,22 +26,31 @@
     <tr>
       <td>{{ p.name }}</td>
       <td>
-        {% if p.owner %}
-          {{ p.owner.username }}
-        {% else %}
-          <span class="badge bg-secondary">System</span>
+        {% if p.owner %} {{ p.owner.username }} {% else %}
+        <span class="badge bg-secondary">System</span>
         {% endif %}
       </td>
-      <td><span class="badge bg-light text-dark border">{{ p.strategy }}</span></td>
+      <td>
+        <span class="badge bg-light text-dark border">{{ p.strategy }}</span>
+      </td>
       <td class="text-end">{{ p.total_capital|floatformat:2 }}</td>
       <td class="text-end">{{ p.item_count }}</td>
       <td>{{ p.created_at|date:"d M Y H:i" }}</td>
       <td>
-        <a href="{% url 'portfolio:detail' p.pk %}" class="btn btn-outline-primary btn-sm">View</a>
+        <a
+          href="{% url 'portfolio:detail' p.name %}"
+          class="btn btn-outline-primary btn-sm"
+          >View</a
+        >
       </td>
     </tr>
     {% empty %}
-    <tr><td colspan="7" class="text-muted">No portfolios yet — run the Composite Engine with "Save reports" enabled.</td></tr>
+    <tr>
+      <td colspan="7" class="text-muted">
+        No portfolios yet — run the Composite Engine with "Save reports"
+        enabled.
+      </td>
+    </tr>
     {% endfor %}
   </tbody>
 </table>
@@ -48,17 +59,26 @@
 <nav aria-label="Portfolio pagination">
   <ul class="pagination">
     {% if page_obj.has_previous %}
-      <li class="page-item"><a class="page-link" href="?page={{ page_obj.previous_page_number }}">Previous</a></li>
+    <li class="page-item">
+      <a class="page-link" href="?page={{ page_obj.previous_page_number }}"
+        >Previous</a
+      >
+    </li>
     {% else %}
-      <li class="page-item disabled"><span class="page-link">Previous</span></li>
+    <li class="page-item disabled"><span class="page-link">Previous</span></li>
     {% endif %}
-    <li class="page-item disabled"><span class="page-link">Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}</span></li>
+    <li class="page-item disabled">
+      <span class="page-link"
+        >Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}</span
+      >
+    </li>
     {% if page_obj.has_next %}
-      <li class="page-item"><a class="page-link" href="?page={{ page_obj.next_page_number }}">Next</a></li>
+    <li class="page-item">
+      <a class="page-link" href="?page={{ page_obj.next_page_number }}">Next</a>
+    </li>
     {% else %}
-      <li class="page-item disabled"><span class="page-link">Next</span></li>
+    <li class="page-item disabled"><span class="page-link">Next</span></li>
     {% endif %}
   </ul>
 </nav>
-{% endif %}
-{% endblock %}
+{% endif %} {% endblock %}

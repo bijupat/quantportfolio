@@ -132,3 +132,18 @@ class TrainingRun(models.Model):
     started_at     = models.DateTimeField(null=True)
     finished_at    = models.DateTimeField(null=True)
     log_output     = models.TextField(blank=True)
+
+
+class NonTradingDay(models.Model):
+    """A calendar date confirmed to have no market data (exchange holiday).
+
+    Populated automatically the first time get_price_bars() requests a date
+    range yfinance returns empty for. Market-wide (not per-symbol), so one
+    row here saves a redundant yfinance call for every symbol on every
+    future fetch_prices run.
+    """
+    date = models.DateField(unique=True, db_index=True)
+    noted_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self) -> str:
+        return str(self.date)

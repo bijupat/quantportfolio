@@ -13,20 +13,25 @@ def save_portfolio_to_db(
     name: str,
     holdings: List[Dict],
     total_amount: float,
-    strategy_tag: str = "composite"
+    strategy_tag: str = "composite",
+    owner=None,
 ) -> Portfolio:
     """
     Saves a portfolio and its line items into the database.
+
+    Args:
+        owner: The core.User this portfolio belongs to, if any. None produces
+            a system-generated/ownerless portfolio (e.g. CLI/legacy imports).
     """
     portfolio, _ = Portfolio.objects.update_or_create(
         name=name,
         defaults={
             "total_capital": total_amount,
             "strategy": strategy_tag,
-            "is_active": True
+            "is_active": True,
+            "owner": owner,
         }
     )
-    
     # Clear old items if updating an existing active portfolio
     portfolio.items.all().delete()
     
@@ -80,3 +85,4 @@ def load_portfolio_from_csv_to_db(csv_path: str, portfolio_name: str) -> Portfol
         h["allocation_pct"] = (h["allocation_rs"] / total_val * 100) if total_val > 0 else 0.0
         
     return save_portfolio_to_db(portfolio_name, holdings, total_val, strategy_tag="legacy_csv")
+

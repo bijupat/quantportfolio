@@ -1,6 +1,6 @@
 from datetime import datetime
 from django.core.management.base import BaseCommand, CommandError
-from core.models import Symbol, Universe
+from core.models import Symbol, Universe, User
 from market_data.models import TrainedModel
 from portfolio.services.portfolio_service import save_portfolio_to_db
 from forecasting.services.ensemble import run_ensemble_layer
@@ -23,7 +23,7 @@ class Command(BaseCommand):
         parser.add_argument('--as-of', type=str, default=None, help='Date to predict for (YYYY-MM-DD)')
         parser.add_argument('--top-n', type=int, default=10, help='Number of BUY-tier stocks')
         parser.add_argument('--amount', type=float, default=100000.0, help='Portfolio capital')
-        
+        parser.add_argument('--user-id', type=int, default=None, help='ID of the core.User who triggered this run (sets Portfolio.owner)')
         # Layer toggles
         parser.add_argument('--w-transformer', type=float, default=0.80)
         parser.add_argument('--w-quality', type=float, default=0.12)
@@ -138,12 +138,20 @@ class Command(BaseCommand):
 
         # 5. Save Portfolio to DB and Reports
         if options['plot']:
+            owner = None
+            user_id = options.get('user_id')
+            if user_id:
+                try:
+                    owner = User.objects.get(pk=user_id)
+                except User.DoesNotExist:
+                    self.stdout.write(self.style.WARNING(f"User id {user_id} not found; portfolio will be saved without an owner."))
             portfolio_name = f"composite_{'_'.join(model_names)[:10]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             saved_portfolio = save_portfolio_to_db(
                 name=portfolio_name,
                 holdings=portfolio_holdings,
                 total_amount=options['amount'],
-                strategy_tag="composite_ai"
+                strategy_tag="composite_ai",
+                owner=owner,
             )
             self.stdout.write(self.style.SUCCESS(f"Portfolio successfully saved to database as: '{saved_portfolio.name}'"))
 

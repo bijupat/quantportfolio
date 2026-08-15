@@ -168,6 +168,7 @@ class RunCompositeTriggerView(AdminRequiredMixin, View):
                 "w_technical": float(request.POST.get("w_technical") or 0.08),
                 "no_sentiment": request.POST.get("use_sentiment") != "on",
                 "plot": request.POST.get("save_reports") == "on",
+                "user_id": request.user.id,
             }
         except ValueError:
             messages.error(request, "Top-N, amount, and layer-weight fields must be valid numbers.")

@@ -19,6 +19,18 @@ def _visible_portfolios_qs(user) -> QuerySet[Portfolio]:
         return qs
     return qs.filter(Q(owner=user) | Q(owner__isnull=True))
 
+def _visible_portfolios_qs(user) -> QuerySet[Portfolio]:
+    """Returns the Portfolios this user is allowed to see.
+
+    Admins see every portfolio. Analysts see their own, ownerless/system-generated
+    ones, and composite-engine-generated ones regardless of which admin triggered
+    the run — composite portfolios are shared analytical output, not personal data,
+    even though Portfolio.owner records who ran the job for audit purposes.
+    """
+    qs = Portfolio.objects.select_related("owner").order_by("-created_at")
+    if user.is_admin_role:
+        return qs
+    return qs.filter(Q(owner=user) | Q(owner__isnull=True) | Q(strategy="composite_ai"))
 
 class PortfolioListView(LoginRequiredMixin, ListView):
     """Lists database-stored Portfolio records (manage_portfolio --list equivalent)."""
@@ -39,6 +51,8 @@ class PortfolioDetailView(LoginRequiredMixin, DetailView):
     model = Portfolio
     template_name = "portfolio/detail.html"
     context_object_name = "portfolio"
+    slug_field = "name"
+    slug_url_kwarg = "name"
 
     def get_queryset(self) -> QuerySet[Portfolio]:
         """Restricts lookup to portfolios visible to the requesting user.
