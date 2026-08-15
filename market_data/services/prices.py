@@ -41,8 +41,30 @@ def _contiguous_ranges(dates: List[date]) -> List[tuple[date, date]]:
     ranges.append((start_date, prev_date))
     return ranges
 
+# market_data/services/prices.py
+
+# Tickers trusted to teach the SHARED NonTradingDay cache about holidays.
+# These are broad indices that have existed continuously for decades, so
+# "yfinance returned nothing for this date" reliably means "market closed,"
+# not "this instrument didn't exist yet."
+#
+# Regular equity tickers must NEVER write to NonTradingDay: a stock that
+# IPO'd in 2023 returns empty data for every day before its listing, and if
+# that gets recorded as a global holiday, every OTHER (much older) symbol
+# processed afterwards silently loses real history for that whole window.
+# Confirmed via fetch_prices job on nifty100 (Aug 2026): VEDL/TATAPOWER/
+# TORNTPHARM/UNIONBANK/UNITDSPR/ZYDUSLIFE all lost 11+ years of history this way.
+MARKET_CALENDAR_AUTHORITIES = {"^NSEI", "^BSESN"}
+
 
 def get_price_bars(symbol: Symbol, start: date, end: date) -> QuerySet[PriceBar]:
+    """Ensures PriceBar rows exist for symbol across [start, end], fetching gaps from yfinance.
+
+    Only MARKET_CALENDAR_AUTHORITIES may record entries in the shared
+    NonTradingDay cache. A regular equity returning no data for a range
+    usually just means it wasn't listed yet — symbol-specific, and never
+    to be read as "the market was closed for everyone."
+    """
     existing_dates = set(
         PriceBar.objects.filter(symbol=symbol, date__range=(start, end))
         .values_list("date", flat=True)
@@ -51,6 +73,8 @@ def get_price_bars(symbol: Symbol, start: date, end: date) -> QuerySet[PriceBar]
 
     trading_days = _expected_trading_days(start, end) - known_holidays
     missing_days = sorted(trading_days - existing_dates)
+
+    is_calendar_authority = symbol.ticker in MARKET_CALENDAR_AUTHORITIES
 
     if missing_days:
         logger.info(f"Missing {len(missing_days)} days for {symbol.ticker}. Fetching from yfinance...")
@@ -83,14 +107,15 @@ def get_price_bars(symbol: Symbol, start: date, end: date) -> QuerySet[PriceBar]
                 else:
                     returned_dates = set()
 
-                # Any requested trading day yfinance didn't return is a confirmed holiday —
-                # cache it so it's never re-queried again for ANY symbol.
-                requested_days = _expected_trading_days(lo, hi)
-                confirmed_holidays = requested_days - returned_dates
-                if confirmed_holidays:
-                    NonTradingDay.objects.bulk_create(
-                        [NonTradingDay(date=d) for d in confirmed_holidays], ignore_conflicts=True
-                    )
+                # Only a trusted index ticker may promote "no data returned"
+                # into a shared holiday record.
+                if is_calendar_authority:
+                    requested_days = _expected_trading_days(lo, hi)
+                    confirmed_holidays = requested_days - returned_dates
+                    if confirmed_holidays:
+                        NonTradingDay.objects.bulk_create(
+                            [NonTradingDay(date=d) for d in confirmed_holidays], ignore_conflicts=True
+                        )
 
             except Exception as e:
                 logger.error(f"Failed to fetch {symbol.ticker} from yfinance: {e}")
@@ -98,6 +123,25 @@ def get_price_bars(symbol: Symbol, start: date, end: date) -> QuerySet[PriceBar]
             time.sleep(0.5)
 
     return PriceBar.objects.filter(symbol=symbol, date__range=(start, end)).order_by("date")
+
+
+def sync_market_calendar(start: date, end: date) -> int:
+    """Rebuilds the shared NonTradingDay cache from a trusted index ticker.
+
+    Call before bulk-fetching a universe of equities so legitimate holidays
+    are known upfront, rather than being (unsafely) inferred per-symbol.
+
+    Args:
+        start: Start of the date range to sync.
+        end: End of the date range to sync.
+
+    Returns:
+        Count of NonTradingDay rows present in [start, end] after sync.
+    """
+    symbol, _ = Symbol.objects.get_or_create(ticker="^NSEI")
+    get_price_bars(symbol, start, end)  # writes NonTradingDay as a side effect (authority ticker)
+    return NonTradingDay.objects.filter(date__range=(start, end)).count()
+
 
 def dataframe_from_bars(queryset: QuerySet[PriceBar]) -> pd.DataFrame:
     """Helper to convert the Django QuerySet back into a Pandas DataFrame for technical analysis."""

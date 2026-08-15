@@ -5,7 +5,7 @@ import yfinance as yf
 from django.core.management.base import BaseCommand, CommandError
 
 from core.models import Symbol, Universe
-from market_data.services.prices import get_price_bars, backfill_symbol_metadata
+from market_data.services.prices import get_price_bars, backfill_symbol_metadata, sync_market_calendar
 
 
 class Command(BaseCommand):
@@ -49,7 +49,9 @@ class Command(BaseCommand):
                 f"Processing universe '{universe_name}' ({len(symbols)} symbols) starting from {start_date}..."
             )
         )
-
+        self.stdout.write("Syncing market holiday calendar from ^NSEI...")
+        holiday_count = sync_market_calendar(start_date, end_date)
+        self.stdout.write(f"  {holiday_count} known non-trading days in range.")        
         # 3. Fetch metadata + price bars for each symbol already tied to this universe.
         for symbol_obj in symbols:
             ticker = symbol_obj.ticker

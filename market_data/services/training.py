@@ -18,8 +18,7 @@ from market_data.services.prices import get_price_bars, dataframe_from_bars
 from market_data.services.indicators import get_indicators
 from market_data.services.sentiment import get_sentiment
 from market_data.services.quality import get_quality_scores_bulk
-from market_data.services.market_context import get_market_context
-
+from market_data.services.market_context import get_market_context_features
 from model_transformer import (
     build_transformer_model,
     train_model as keras_train_model,
@@ -58,15 +57,9 @@ def build_dataset_from_db(
     """
     logger.info("=== DB-FIRST DATASET BUILD STARTED ===")
     
-    # 1. Fetch benchmark market context from DB
-    ctx_qs = get_market_context("^NSEI", start_date, end_date)
-    ctx_data = list(ctx_qs.values("date", "values"))
-    if ctx_data:
-        ctx_df = pd.DataFrame([{"Date": pd.to_datetime(d["date"]), **d["values"]} for d in ctx_data])
-        ctx_df.set_index("Date", inplace=True)
-    else:
-        ctx_df = pd.DataFrame()
-
+    # 1. Fetch benchmark market context (NIFTY + SENSEX, prefixed) from DB
+    ctx_df = get_market_context_features(start_date, end_date)
+    
     all_X, all_y = [], []
     scalers_info = {}
     master_feature_cols = []
