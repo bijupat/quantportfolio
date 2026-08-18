@@ -59,23 +59,41 @@
 <h5 class="mt-5">Recent Jobs</h5>
 <table class="table table-sm align-middle">
   <thead>
-    <tr><th>Command</th><th>Status</th><th>Started</th><th>Finished</th><th>By</th></tr>
+    <tr>
+      <th>Job Type</th>
+      <th>Universe</th>
+      <th>Start Date</th>
+      <th>Status</th>
+      <th>Started</th>
+      <th>Finished</th>
+      <th>By</th>
+    </tr>
   </thead>
   <tbody>
     {% for job in recent_jobs %}
     <tr>
-      <td><code>{{ job.command_name }}</code></td>
+      <td>
+        {% if job.command_name == "fetch_prices" %}
+          Fetch Prices
+        {% elif job.command_name == "seed_universes" %}
+          Seed Universes
+        {% else %}
+          <code>{{ job.command_name }}</code>
+        {% endif %}
+      </td>
+      <td>{{ job.options.universe|default:"—" }}</td>
+      <td>{{ job.options.start|default:"—" }}</td>
       <td>
         <span class="badge {% if job.status == 'success' %}bg-success{% elif job.status == 'failed' %}bg-danger{% elif job.status == 'running' %}bg-info{% else %}bg-secondary{% endif %}">
           {{ job.get_status_display }}
         </span>
       </td>
-      <td>{{ job.started_at|default:"—" }}</td>
-      <td>{{ job.finished_at|default:"—" }}</td>
+      <td>{{ job.started_at|date:"d M Y H:i"|default:"—" }}</td>
+      <td>{{ job.finished_at|date:"d M Y H:i"|default:"—" }}</td>
       <td>{{ job.triggered_by|default:"—" }}</td>
     </tr>
     {% empty %}
-    <tr><td colspan="5" class="text-muted">No jobs run yet.</td></tr>
+    <tr><td colspan="7" class="text-muted">No jobs run yet.</td></tr>
     {% endfor %}
   </tbody>
 </table>

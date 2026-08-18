@@ -18,6 +18,11 @@ SECRET_KEY = env('SECRET_KEY')
 DEBUG = env('DEBUG')
 ALLOWED_HOSTS = ['*']
 
+
+TIME_ZONE = env('TIME_ZONE', default='Asia/Kolkata')
+USE_TZ = True
+
+
 # Application Definition
 INSTALLED_APPS = [
     'django.contrib.admin',

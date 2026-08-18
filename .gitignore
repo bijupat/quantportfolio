@@ -8,3 +8,4 @@ media/charts/
 media/reports/
 data_cache/
 db.sqlite3
+.vscode/
