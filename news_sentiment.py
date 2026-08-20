@@ -51,6 +51,17 @@ except ImportError:
     log.info("nltk not installed; VADER unavailable.")
 
 # ─────────────────────────────────────────────
+# NewsAPI coverage constraint
+# ─────────────────────────────────────────────
+# NewsAPI's free/developer tier only serves articles from roughly the last
+# month, regardless of the `from` date requested — asking further back
+# doesn't error, it just silently returns nothing for the older portion.
+# Callers (see market_data.services.sentiment.get_sentiment) use this to
+# decide which missing dates are even worth a real API call vs. going
+# straight to synthetic generation.
+NEWSAPI_LOOKBACK_DAYS = 30
+
+# ─────────────────────────────────────────────
 # Bullish / Bearish keyword lexicon
 # ─────────────────────────────────────────────
 BULLISH_WORDS = [
@@ -156,10 +167,31 @@ def score_headlines(headlines: List[str]) -> List[float]:
 # ─────────────────────────────────────────────
 # NewsAPI fetcher
 # ─────────────────────────────────────────────
-def fetch_newsapi(symbol: str, days: int = 30) -> List[Dict]:
+def fetch_newsapi(
+    symbol: str,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    days: int = 30,
+) -> List[Dict]:
     """
-    Fetch articles from NewsAPI.  Requires NEWSAPI_KEY env var.
-    Returns list of {date, headline, source}.
+    Fetch articles from NewsAPI within an explicit [from_date, to_date] window.
+    Requires NEWSAPI_KEY env var. Returns list of {date, headline, source}.
+
+    Args:
+        symbol: Ticker, e.g. 'RELIANCE.NS'.
+        from_date: 'YYYY-MM-DD' lower bound (inclusive). If omitted, defaults to
+            `days` before `to_date` — preserves the original days-back behavior
+            for existing callers that don't pass explicit bounds.
+        to_date: 'YYYY-MM-DD' upper bound (inclusive). Defaults to today.
+        days: Fallback window size (days back from to_date), used only when
+            from_date is not supplied.
+
+    Note: NewsAPI's free/developer tier only actually has articles from the
+    last ~NEWSAPI_LOOKBACK_DAYS days — requesting further back won't error,
+    it will just return no matching articles for the older portion of the
+    range. Callers needing full historical coverage should pair this with
+    generate_synthetic_news() for dates outside that window rather than
+    relying on this function alone.
     """
     api_key = os.environ.get("NEWSAPI_KEY", "")
     if not api_key:
@@ -167,12 +199,19 @@ def fetch_newsapi(symbol: str, days: int = 30) -> List[Dict]:
 
     try:
         import requests
-        query   = symbol.replace(".NS", "").replace(".BO", "")
-        from_dt = (datetime.datetime.today() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+        query = symbol.replace(".NS", "").replace(".BO", "")
+
+        to_dt_obj = (
+            datetime.datetime.strptime(to_date, "%Y-%m-%d")
+            if to_date else datetime.datetime.today()
+        )
+        from_dt = from_date or (to_dt_obj - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+        to_dt = to_dt_obj.strftime("%Y-%m-%d")
+
         url = (
             f"https://newsapi.org/v2/everything"
             f"?q={query}+stock+india"
-            f"&from={from_dt}&sortBy=publishedAt"
+            f"&from={from_dt}&to={to_dt}&sortBy=publishedAt"
             f"&language=en&pageSize=100"
             f"&apiKey={api_key}"
         )

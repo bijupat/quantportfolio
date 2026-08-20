@@ -78,6 +78,14 @@ class TrainedModel(models.Model):
     name           = models.SlugField(unique=True)
     model_type     = models.CharField(max_length=30, choices=MODEL_TYPES, default=STANDARD)
     seq_len        = models.IntegerField()
+    horizon        = models.IntegerField(
+        default=30,
+        help_text="Forward-return horizon (in trading days) this model was trained to predict "
+                   "(see market_data.services.training.create_labels). Downstream inference "
+                   "(forecasting.services.predictor.get_or_predict_bulk) must read this field "
+                   "instead of hardcoding a horizon, or predictions silently target the wrong "
+                   "window for any model trained with a non-default horizon.",
+    )
     d_model        = models.IntegerField()
     n_heads        = models.IntegerField()
     n_layers       = models.IntegerField()

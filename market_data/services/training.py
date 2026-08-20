@@ -35,8 +35,40 @@ from util import clip_outliers, build_sequences
 
 logger = logging.getLogger(__name__)
 
+# Piotroski/Altman fundamentals (market_data.services.quality) are fetched
+# from yfinance's *current* financial statements — piotroski.py/altman.py
+# both pull ticker.financials/balance_sheet/cashflow, which yfinance always
+# returns as the company's latest reported fiscal years, regardless of what
+# date is being computed for. There is no point-in-time historical snapshot
+# available from this data source.
+#
+# Without bounding this, build_dataset_from_db's is_hybrid branch would
+# broadcast a single "as of build time" score across the entire feat_df
+# index — which can span a decade — feeding 2025 fundamentals into 2015
+# training rows as if they were true then (bug #2: direct lookahead
+# leakage). This constant bounds how far back that broadcast is allowed to
+# reach before falling back to a neutral value instead.
+#
+# This is a mitigation, not a full fix: it shrinks the leakage window, it
+# doesn't eliminate leakage within that window (the value used is still
+# "whatever's true today," which may differ from what was knowable on any
+# specific day within the window too, e.g. if a new filing landed partway
+# through it). Fully eliminating this would require a point-in-time
+# fundamentals data source, which is out of scope here. Tune down for a
+# stricter (more neutral-filled, less leaky) dataset, or up for more "real"
+# signal at the cost of a wider leakage window.
+HYBRID_FUNDAMENTALS_RECENCY_WINDOW_DAYS = 90
+
+# Neutral fill value for hybrid quality features outside the recency window
+# above, and matches the existing "no data available" convention used
+# elsewhere in this codebase (see quality.compute_composite_quality's
+# p_norm fallback) — a genuinely unknown/inapplicable score, not an
+# assertion that the stock is average.
+NEUTRAL_QUALITY_FILL = 0.5
+
+
 def create_labels(close: pd.Series, horizon: int = 30) -> pd.Series:
-    """30-day forward return label: (close[t+horizon] - close[t]) / close[t]"""
+    """Forward return label over `horizon` trading days: (close[t+horizon] - close[t]) / close[t]"""
     future_close = close.shift(-horizon)
     return (future_close - close) / (close + 1e-9)
 # ---------------------------------------------------------------------------
@@ -51,11 +83,42 @@ def build_dataset_from_db(
     horizon: int = 30,
     use_sentiment: bool = True,
     is_hybrid: bool = False,
+    mode: str = "train",
 ) -> Tuple[np.ndarray, np.ndarray, Dict, List[str]]:
     """
     Builds (X, y) sequence matrices using Django DB services as the data source.
+
+    Args:
+        symbols: Symbols to build sequences for.
+        start_date: Start of the price/feature history window.
+        end_date: End of the price/feature history window (inclusive).
+        seq_len: Length of each input sequence window.
+        horizon: Forward-return horizon in trading days. Only meaningful in
+            mode="train" (used to compute labels); ignored for label purposes
+            in mode="inference" since no forward label exists yet.
+        use_sentiment: Whether to join sentiment features onto the feature matrix.
+        is_hybrid: Whether to include hybrid-model fundamental feature columns.
+            See HYBRID_FUNDAMENTALS_RECENCY_WINDOW_DAYS above for how
+            lookahead exposure from quality scores is bounded, and the
+            module docstring above for the [ts | financial | sentiment]
+            column-ordering contract this branch must produce (see
+            model_transformer.TripleBranchHybridModel.call()).
+        mode: "train" (default) computes forward-return labels via
+            create_labels() and drops the trailing `horizon` rows near
+            end_date that have no future close to label against. "inference"
+            skips label computation and keeps every row through end_date,
+            returning a single window anchored at the actual most recent
+            available date.
+
+    Returns:
+        Tuple of (X, y, scalers_info, feature_columns). In mode="inference",
+        X contains exactly one window per symbol and y is an unused
+        zero-filled placeholder.
     """
-    logger.info("=== DB-FIRST DATASET BUILD STARTED ===")
+    if mode not in ("train", "inference"):
+        raise ValueError(f"mode must be 'train' or 'inference', got {mode!r}")
+
+    logger.info(f"=== DB-FIRST DATASET BUILD STARTED (mode={mode}) ===")
     
     # 1. Fetch benchmark market context (NIFTY + SENSEX, prefixed) from DB
     ctx_df = get_market_context_features(start_date, end_date)
@@ -66,13 +129,15 @@ def build_dataset_from_db(
 
     # 2. Iterate through requested symbols
     for symbol in symbols:
-        logger.info(f"Processing DB training sequences for {symbol.ticker}...")
+        logger.info(f"Processing DB {mode} sequences for {symbol.ticker}...")
 
         # Price history from DB
         bars_qs = get_price_bars(symbol, start_date, end_date)
         raw_df = dataframe_from_bars(bars_qs)
-        if raw_df.empty or len(raw_df) < (seq_len + horizon + 10):
-            logger.warning(f"Insufficient price history in DB for {symbol.ticker}. Skipping.")
+
+        min_bars_required = (seq_len + 10) if mode == "inference" else (seq_len + horizon + 10)
+        if raw_df.empty or len(raw_df) < min_bars_required:
+            logger.warning(f"Insufficient price history in DB for {symbol.ticker} (mode={mode}). Skipping.")
             continue
 
         # Technical indicators from DB
@@ -103,12 +168,22 @@ def build_dataset_from_db(
                 feat_df[c] = 0.0
         feat_df.fillna(0.0, inplace=True)
 
-        # Hybrid model includes fundamental scores in feature matrix
         if is_hybrid:
+            # ── Bug #2 mitigation: bounded lookahead for quality features ──
+            # get_quality_scores_bulk returns ONE score per symbol, computed
+            # from yfinance's current financials — see the
+            # HYBRID_FUNDAMENTALS_RECENCY_WINDOW_DAYS docstring above for why
+            # true point-in-time correctness isn't achievable here. Only
+            # rows within the recency window of end_date get that real
+            # value; older rows get a neutral fill instead of a
+            # misattributed one, bounding (not eliminating) the leakage.
             qual_qs = get_quality_scores_bulk([symbol], end_date)
             qual_obj = qual_qs.first()
             p_norm = (qual_obj.piotroski_score / 9.0) if (qual_obj and qual_obj.piotroski_score) else 0.5
             a_norm = min(max(qual_obj.altman_z, 0.0), 5.0) / 5.0 if (qual_obj and qual_obj.altman_z) else 0.0
+
+            recency_cutoff = pd.Timestamp(end_date) - pd.Timedelta(days=HYBRID_FUNDAMENTALS_RECENCY_WINDOW_DAYS)
+            within_recency_window = feat_df.index >= recency_cutoff
 
             feat_df["returnOnEquity"] = 0.12
             feat_df["returnOnAssets"] = 0.05
@@ -116,18 +191,41 @@ def build_dataset_from_db(
             feat_df["revenueGrowth"] = 0.10
             feat_df["debtToEquity"] = 0.15
             feat_df["freeCashflow_norm"] = 0.05
-            feat_df["piotroski_score_norm"] = p_norm
-            feat_df["altman_z_norm"] = a_norm
+            feat_df["piotroski_score_norm"] = np.where(within_recency_window, p_norm, NEUTRAL_QUALITY_FILL)
+            feat_df["altman_z_norm"] = np.where(within_recency_window, a_norm, NEUTRAL_QUALITY_FILL)
 
-        # Labels (30-day forward return)
-        labels = create_labels(raw_df["Close"], horizon=horizon)
-        feat_df["__label__"] = labels.reindex(feat_df.index)
+            # ── Bug #1 fix: explicit [ts | financial | sentiment] ordering ──
+            # TripleBranchHybridModel.call() (model_transformer.py) slices
+            # positionally: x[:, :, :n_ts], x[:, 0, n_ts:n_ts+n_fin],
+            # x[:, :, n_ts+n_fin:]. That model code was always correct — the
+            # bug was here: sentiment columns were joined onto feat_df
+            # BEFORE this block runs, so the previous column order was
+            # [ts | sentiment | financial], not [ts | financial | sentiment].
+            # Every hybrid model trained before this fix learned on branches
+            # fed scrambled data (part financial + part sentiment in each
+            # slot) and should be considered invalid / retrained.
+            ts_cols = [c for c in feat_df.columns if c not in FINANCIAL_FEATURES and c not in SENTIMENT_FEATURES]
+            feat_df = feat_df[ts_cols + FINANCIAL_FEATURES + SENTIMENT_FEATURES]
+        else:
+            # Explicit feature-column enforcement (standard/non-hybrid path).
+            expected_cols = FEATURE_COLUMNS + MARKET_CONTEXT_COLS
+            for col in expected_cols:
+                if col not in feat_df.columns:
+                    feat_df[col] = 0.0
+            feat_df = feat_df[expected_cols]
 
-        # Clean NaNs
-        feat_df.dropna(subset=["__label__"], inplace=True)
-        feat_df.ffill().bfill().fillna(0.0, inplace=True)
+        if mode == "train":
+            labels = create_labels(raw_df["Close"], horizon=horizon)
+            feat_df["__label__"] = labels.reindex(feat_df.index)
+            feat_df.dropna(subset=["__label__"], inplace=True)
+        else:
+            feat_df["__label__"] = 0.0
 
-        if len(feat_df) < (seq_len + 10):
+        feat_df = feat_df.ffill().bfill()
+        feat_df.fillna(0.0, inplace=True)
+
+        min_len_required = seq_len if mode == "inference" else (seq_len + 10)
+        if len(feat_df) < min_len_required:
             continue
 
         # Column ordering (preserve __label__ during alignment)
@@ -139,7 +237,6 @@ def build_dataset_from_db(
                 if col not in feat_df.columns:
                     feat_df[col] = 0.0
             
-            # Keep the target label safe while forcing column alignment
             label_backup = feat_df["__label__"].copy()
             feat_df = feat_df[master_feature_cols]
             feat_df["__label__"] = label_backup
@@ -159,8 +256,13 @@ def build_dataset_from_db(
 
         scalers_info[symbol.ticker] = scaler_dict
 
-        # Build sliding windows
-        X_sym, y_sym = build_sequences(feat_norm.astype(np.float32), label_arr, seq_len=seq_len)
+        if mode == "train":
+            X_sym, y_sym = build_sequences(feat_norm.astype(np.float32), label_arr, seq_len=seq_len)
+        else:
+            X_last = feat_norm[-seq_len:].astype(np.float32)
+            X_sym = X_last[np.newaxis, ...]
+            y_sym = np.zeros((1,), dtype=np.float32)
+
         if len(X_sym) > 0:
             all_X.append(X_sym)
             all_y.append(y_sym)
@@ -171,12 +273,12 @@ def build_dataset_from_db(
     X_all = np.concatenate(all_X, axis=0)
     y_all = np.concatenate(all_y, axis=0)
 
-    # Cross-stock shuffle
-    shuffle_idx = np.random.permutation(len(X_all))
-    X_all = X_all[shuffle_idx]
-    y_all = y_all[shuffle_idx]
+    if mode == "train":
+        shuffle_idx = np.random.permutation(len(X_all))
+        X_all = X_all[shuffle_idx]
+        y_all = y_all[shuffle_idx]
 
-    logger.info(f"DB Dataset created: X={X_all.shape}, y={y_all.shape}")
+    logger.info(f"DB Dataset created (mode={mode}): X={X_all.shape}, y={y_all.shape}")
     return X_all, y_all, scalers_info, master_feature_cols
 
 
@@ -202,7 +304,6 @@ def train_standard_model_service(
     """
     Trains a QuantTransformer model on DB data and registers it in TrainedModel.
     """
-    # 1. Dataset
     X, y, scalers_info, feature_cols = build_dataset_from_db(
         symbols=symbols,
         start_date=start_date,
@@ -215,14 +316,12 @@ def train_standard_model_service(
 
     n_features = X.shape[2]
 
-    # 2. Walk-forward split
     splits = walk_forward_splits(len(X), train_ratio=0.70, val_ratio=0.15)
     tr_sl, val_sl, te_sl = splits[0]
     X_train, y_train = X[tr_sl], y[tr_sl]
     X_val, y_val = X[val_sl], y[val_sl]
     X_test, y_test = X[te_sl], y[te_sl]
 
-    # 3. Keras Build & Train
     model = build_transformer_model(
         seq_len=seq_len,
         n_features=n_features,
@@ -238,20 +337,18 @@ def train_standard_model_service(
         epochs=epochs, batch_size=batch_size, model_name=model_name,
     )
 
-    # 4. Evaluation
     eval_metrics = keras_evaluate_model(model, X_test, y_test)
 
-    # 5. Architecture metadata
     arch_data = {
         "seq_len": seq_len,
         "n_features": n_features,
         "d_model": d_model,
         "n_heads": n_heads,
         "n_layers": n_layers,
+        "horizon": horizon,
         "model_type": TrainedModel.STANDARD,
     }
 
-    # 6. Save weights to temporary file & register in DB
     with tempfile.NamedTemporaryFile(suffix=".weights.h5", delete=False) as tmp_file:
         tmp_weights_path = tmp_file.name
 
@@ -269,6 +366,7 @@ def train_standard_model_service(
             defaults={
                 "model_type": TrainedModel.STANDARD,
                 "seq_len": seq_len,
+                "horizon": horizon,
                 "d_model": d_model,
                 "n_heads": n_heads,
                 "n_layers": n_layers,
@@ -283,6 +381,7 @@ def train_standard_model_service(
         with open(tmp_weights_path, "rb") as f_in:
             trained_model.weights_file.save(f"{model_name}.weights.h5", File(f_in), save=True)
 
+        trained_model.horizon = horizon
         trained_model.arch_json = arch_data
         trained_model.scalers_json = scalers_info
         trained_model.eval_json = eval_metrics
@@ -313,8 +412,12 @@ def train_hybrid_model_service(
 ) -> TrainedModel:
     """
     Trains a TripleBranchHybridModel on DB data and registers it in TrainedModel.
+
+    NOTE: horizon is currently hardcoded to 30 below (not yet read from a
+    --horizon CLI option, since train_hybrid_model.py has none) — deferred,
+    same as before this pass; only bugs #1 (branch ordering) and #2
+    (fundamentals lookahead) were in scope here.
     """
-    # 1. Dataset
     X, y, scalers_info, feature_cols = build_dataset_from_db(
         symbols=symbols,
         start_date=start_date,
@@ -330,14 +433,12 @@ def train_hybrid_model_service(
     n_sent_features = len([c for c in feature_cols if c in SENTIMENT_FEATURES])
     n_total = X.shape[2]
 
-    # 2. Split
     splits = walk_forward_splits(len(X), train_ratio=0.70, val_ratio=0.15)
     tr_sl, val_sl, te_sl = splits[0]
     X_train, y_train = X[tr_sl], y[tr_sl]
     X_val, y_val = X[val_sl], y[val_sl]
     X_test, y_test = X[te_sl], y[te_sl]
 
-    # 3. Keras Build & Train
     model = build_hybrid_model(
         seq_len=seq_len,
         n_ts_features=n_ts_features,
@@ -355,7 +456,6 @@ def train_hybrid_model_service(
         epochs=epochs, batch_size=batch_size,
     )
 
-    # 4. Evaluation
     y_pred = model.predict(X_test, verbose=0).flatten()
     from scipy.stats import spearmanr
     mse = float(np.mean((y_test - y_pred) ** 2))
@@ -368,7 +468,6 @@ def train_hybrid_model_service(
         "IC_Spearman": float(ic) if np.isfinite(ic) else 0.0,
     }
 
-    # 5. Architecture metadata
     arch_data = {
         "seq_len": seq_len,
         "n_features": n_total,
@@ -381,7 +480,6 @@ def train_hybrid_model_service(
         "model_type": TrainedModel.HYBRID,
     }
 
-    # 6. Save weights to temporary file & register in DB
     with tempfile.NamedTemporaryFile(suffix=".weights.h5", delete=False) as tmp_file:
         tmp_weights_path = tmp_file.name
 

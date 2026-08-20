@@ -18,7 +18,8 @@ def get_or_predict_bulk(symbols: list[Symbol], trained_model: TrainedModel, as_o
     Returns a dict mapping symbol IDs to their Prediction objects.
     """
     symbol_ids = [s.id for s in symbols]
-    
+    horizon = trained_model.horizon
+
     # 1. Check Cache
     cached_qs = Prediction.objects.filter(symbol_id__in=symbol_ids, model=trained_model, as_of_date=as_of)
     cached_map = {p.symbol_id: p for p in cached_qs}
@@ -29,7 +30,7 @@ def get_or_predict_bulk(symbols: list[Symbol], trained_model: TrainedModel, as_o
         logger.info("All predictions found in cache.")
         return cached_map
         
-    logger.info(f"Running AI inference for {len(missing_symbols)} symbols using '{trained_model.name}'...")
+    logger.info(f"Running AI inference for {len(missing_symbols)} symbols using '{trained_model.name}' (horizon={horizon}d)...")
     
     # 2. Load the Keras Model
     keras_model = trained_model.build_keras_model()
@@ -43,22 +44,29 @@ def get_or_predict_bulk(symbols: list[Symbol], trained_model: TrainedModel, as_o
             # Fetch a slightly longer window to accommodate seq_len and rolling indicators
             start_history = as_of - pd.Timedelta(days=trained_model.seq_len + 100)
             
-            # Re-use our DB feature builder for inference (returns normalized features)
+            # mode="inference" — returns the single window ending at the most
+            # recent available date up to `as_of`, with no forward-label
+            # requirement (previously this called with the training-mode
+            # default, which silently dropped the trailing `horizon` rows
+            # near as_of and made every "latest" prediction ~horizon trading
+            # days stale).
             X_arr, _, scalers_info, _ = build_dataset_from_db(
                 symbols=[symbol],
                 start_date=start_history,
                 end_date=as_of,
                 seq_len=trained_model.seq_len,
-                horizon=30,
+                horizon=horizon,
                 use_sentiment=use_sentiment,
-                is_hybrid=is_hybrid
+                is_hybrid=is_hybrid,
+                mode="inference",
             )
 
             if len(X_arr) == 0:
                 logger.warning(f"Insufficient data to predict {symbol.ticker}")
                 continue
 
-            # Take the very last sequence window (the most recent one up to 'as_of')
+            # In mode="inference" this is the (only) window, correctly
+            # anchored at the most recent available trading date <= as_of.
             latest_window = X_arr[-1]
             x_tensor = tf.constant(latest_window[np.newaxis], dtype=tf.float32)
             
@@ -73,6 +81,7 @@ def get_or_predict_bulk(symbols: list[Symbol], trained_model: TrainedModel, as_o
                     symbol=symbol,
                     model=trained_model,
                     as_of_date=as_of,
+                    horizon_days=horizon,
                     predicted_return=pred_val,
                     confidence=confidence
                 )
