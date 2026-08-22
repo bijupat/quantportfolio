@@ -12,6 +12,8 @@ from forecasting.services.composite import (
 )
 from forecasting.services.reports import save_portfolio_report_pdf, save_score_breakdown_excel
 from portfolio_optimizer import rank_stocks, score_to_ranking_table, construct_portfolio
+
+
 class Command(BaseCommand):
     help = "Runs composite/ensemble scoring over a universe of stocks."
 
@@ -33,14 +35,14 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         as_of_date = datetime.strptime(options['as_of'], "%Y-%m-%d").date() if options['as_of'] else datetime.today().date()
-        
+
         # Resolve Models
         model_names = options['models']
         weights = options['model_weights'] or [1.0] * len(model_names)
-        
+
         if len(model_names) != len(weights):
             raise CommandError("Number of models must match number of model-weights.")
-            
+
         models_with_weights = {}
         for m_name, w in zip(model_names, weights):
             try:
@@ -61,27 +63,51 @@ class Command(BaseCommand):
         self.stdout.write(self.style.MIGRATE_HEADING("Running Composite Engine..."))
 
         # 1. Ensemble Layer
-        transformer_scores, per_model_scores = run_ensemble_layer(
+        # run_ensemble_layer now returns a 3rd value, contributing_models,
+        # mapping each ticker to the list of model names that actually
+        # scored it. A symbol scored by fewer than len(models_with_weights)
+        # models is flagged downstream in compute_composite_scores'
+        # data_quality dict, rather than silently blending in as if fully
+        # covered.
+        transformer_scores, per_model_scores, contributing_models = run_ensemble_layer(
             symbols=symbols,
             models_with_weights=models_with_weights,
             as_of=as_of_date,
             use_sentiment=not options['no_sentiment']
         )
-        
+
         # 2. Composite Layer
         weights_config = {
             "transformer": options['w_transformer'],
             "quality": options['w_quality'],
             "technical": options['w_technical']
         }
-        
+
         composite_results = compute_composite_scores(
             symbols=symbols,
             as_of=as_of_date,
             transformer_scores=transformer_scores,
             weights_config=weights_config,
-            per_model_scores=per_model_scores
+            per_model_scores=per_model_scores,
+            contributing_models=contributing_models,
+            n_models_requested=len(models_with_weights),
         )
+
+        # 2b. Console visibility for any symbol with reduced data quality —
+        # surfaced here (not just in logs) so a person running this
+        # interactively sees it without needing to check the log file.
+        low_quality_symbols = [
+            sym for sym, d in composite_results.items()
+            if d.get("data_quality", {}).get("quality_no_data")
+            or d.get("data_quality", {}).get("technical_no_data")
+            or d.get("data_quality", {}).get("partial_ensemble")
+        ]
+        if low_quality_symbols:
+            self.stdout.write(self.style.WARNING(
+                f"\n{len(low_quality_symbols)} of {len(composite_results)} symbols have reduced "
+                f"data quality (missing quality/technical history, or scored by only a subset of "
+                f"the ensemble): {', '.join(low_quality_symbols)}"
+            ))
 
         # 3. Portfolio Ranking
         comp_scores_flat = {sym: d["composite_score"] for sym, d in composite_results.items()}
@@ -114,13 +140,21 @@ class Command(BaseCommand):
             representative_score = next(
                 (r for r in composite_score_rows if r.symbol.ticker == top_symbol), None
             )
+            if representative_score is None:
+                self.stdout.write(self.style.WARNING(
+                    f"Top-ranked symbol '{top_symbol}' has no persisted CompositeScore row "
+                    f"(likely missing from the Symbol table) — ReportArtifact.composite_run "
+                    f"will be left unset for this run."
+                ))
 
-        
-        # Build structured holdings for Excel export
+        # Build structured holdings for Excel export. Pass as_of=as_of_date so
+        # historical/backtested runs price holdings as of the run's actual
+        # date rather than "today" (see build_composite_portfolio's as_of arg).
         portfolio_holdings = build_composite_portfolio(
             composite_results=composite_results,
             top_n=options['top_n'],
             portfolio_amount=options['amount'],
+            as_of=as_of_date,
             weighting="score"
         )
 
@@ -128,13 +162,17 @@ class Command(BaseCommand):
         self.stdout.write("\n" + "=" * 72)
         self.stdout.write(f"  {'Rank':<5} {'Symbol':<20} {'Composite':>10}  {'Transformer':>12}  Tier")
         self.stdout.write("-" * 72)
-        
+
         for rank, (sym, row) in enumerate(ranking_df.iterrows(), 1):
             tier = tiers.get(sym, "AVOID")
             comp = row["norm_score"]
             trans = composite_results[sym]["transformer_score"]
             icon = {"BUY": "▲", "HOLD": "─", "AVOID": "▼"}.get(tier, " ")
-            self.stdout.write(f"  {rank:<5} {sym:<20} {comp:>10.4f}  {trans:>12.5f}  {icon} {tier}")
+            flag = " *" if sym in low_quality_symbols else ""
+            self.stdout.write(f"  {rank:<5} {sym:<20} {comp:>10.4f}  {trans:>12.5f}  {icon} {tier}{flag}")
+
+        if low_quality_symbols:
+            self.stdout.write("\n  * = reduced data quality (see warning above)")
 
         # 5. Save Portfolio to DB and Reports
         if options['plot']:

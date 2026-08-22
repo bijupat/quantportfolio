@@ -8,6 +8,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+
 def save_portfolio_report_pdf(
     ranking_df: pd.DataFrame,
     weights: dict,
@@ -106,7 +107,7 @@ def save_portfolio_report_pdf(
             ("VALIGN", (0,0), (-1,-1), "MIDDLE"), ("LEFTPADDING", (0,0), (-1,-1), 8), ("RIGHTPADDING", (0,0), (-1,-1), 8)
         ]))
         story.append(ranking_tbl)
-        
+
         doc.build(story, onFirstPage=page_tmpl, onLaterPages=page_tmpl)
     artifact = ReportArtifact.objects.create(
         kind=ReportArtifact.PDF, portfolio=portfolio, composite_run=composite_run
@@ -116,6 +117,24 @@ def save_portfolio_report_pdf(
         artifact.file.save(f"{now_str}_portfolio_report.pdf", File(f))
     os.remove(tmp.name)
     return artifact
+
+
+def _is_low_quality(detail: dict) -> bool:
+    """Returns True if a composite_results entry's data_quality dict flags reduced confidence.
+
+    Mirrors the same three conditions run_composite.py checks for its console
+    warning (quality_no_data / technical_no_data / partial_ensemble), so the
+    persisted Excel report shows the same signal the person already saw on
+    screen when the run finished — previously this information existed in
+    memory (compute_composite_scores' data_quality dict) but was dropped
+    entirely once results reached the Excel writer; a stock scored on
+    insufficient history looked identical to a fully-scored one in the saved
+    report. Tolerant of composite_results predating this field (e.g. results
+    passed in from a caller that doesn't supply data_quality) — such rows are
+    simply never flagged rather than raising.
+    """
+    dq = detail.get("data_quality") or {}
+    return bool(dq.get("quality_no_data") or dq.get("technical_no_data") or dq.get("partial_ensemble"))
 
 
 def save_score_breakdown_excel(
@@ -163,6 +182,8 @@ def save_score_breakdown_excel(
     GREY_FONT = "FF607D8B"
     STRIPE_EVEN = "FFF5F7FA"
     STRIPE_ODD = "FFFFFFFF"
+    LOW_QUALITY_FILL = "FFFFF3CD"   # pale amber — flags reduced-confidence rows
+    LOW_QUALITY_FONT = "FF8A6D00"
 
     def _hdr_font(bold=True, color=WHITE, size=9): return Font(name="Arial", bold=bold, color=color, size=size)
     def _body_font(bold=False, color="FF0D1B2A", size=9): return Font(name="Arial", bold=bold, color=color, size=size)
@@ -188,19 +209,36 @@ def save_score_breakdown_excel(
     ws.title = "Score Breakdown"
 
     now_str = datetime.now().strftime("%d %b %Y  %H:%M")
-    ws.append([f"QuantPortfolioAI — Full Score Breakdown", f"Generated: {now_str}", f"Symbols: {len(composite_results)}", f"Capital: Rs. {portfolio_amount:,.0f}"])
+    low_quality_total = sum(1 for _, d in composite_results.items() if _is_low_quality(d))
+    ws.append([
+        f"QuantPortfolioAI — Full Score Breakdown", f"Generated: {now_str}",
+        f"Symbols: {len(composite_results)}", f"Capital: Rs. {portfolio_amount:,.0f}",
+        f"Reduced-confidence: {low_quality_total}" if low_quality_total else "",
+    ])
     ws.row_dimensions[1].height = 16
     ws.append([])
 
     HDR_ROW = 3
+    # Column count here MUST stay in lockstep with the row_vals column count
+    # built per-row below (both derive from the same "how many per-model
+    # columns" decision) — previously this was two independently-written
+    # `X if pm_keys else Y` expressions relying on Python's `+=` precedence
+    # matching by coincidence; a one-line edit to either without the other
+    # would silently misalign every column after "Composite" with no error
+    # from openpyxl. n_transformer_cols is now computed once and reused by
+    # both the header and the per-row builder so they cannot drift apart,
+    # and a Data Quality column is appended (also counted here) to surface
+    # the low_quality flag per row.
+    n_transformer_cols = (len(pm_keys) + 1) if pm_keys else 1
+
     grp_row = ["Rank", "Symbol", "Composite"]
-    grp_row += ["Transformer"] * (len(pm_keys) + 1) if pm_keys else ["Transformer"]
-    grp_row += ["Financial", "Technical", "Tier"]
+    grp_row += ["Transformer"] * n_transformer_cols
+    grp_row += ["Financial", "Technical", "Tier", "Data Quality"]
     ws.append(grp_row)
 
     ind_row = ["", "", ""]
-    ind_row += pm_short + ["Weighted"] if pm_keys else [""]
-    ind_row += ["(Piotroski+Altman)", "(TSI)", ""]
+    ind_row += (pm_short + ["Weighted"]) if pm_keys else [""]
+    ind_row += ["(Piotroski+Altman)", "(TSI)", "", ""]
     ws.append(ind_row)
 
     n_cols_total = len(grp_row)
@@ -225,18 +263,21 @@ def save_score_breakdown_excel(
     for rank, (sym, d) in enumerate(sorted_results, 1):
         tier = tiers.get(sym, "AVOID")
         pm = d.get("per_model_scores", {})
+        low_quality = _is_low_quality(d)
+
         row_vals = [rank, sym, d["composite_score"]]
-        row_vals += [pm.get(m, None) for m in pm_keys] + [d["transformer_score"]] if pm_keys else [d["transformer_norm"]]
-        row_vals += [d["quality_score"], d["technical_score"], tier]
+        row_vals += ([pm.get(m, None) for m in pm_keys] + [d["transformer_score"]]) if pm_keys else [d["transformer_norm"]]
+        row_vals += [d["quality_score"], d["technical_score"], tier, "LOW" if low_quality else "OK"]
 
         ws.append(row_vals)
         xl_row = ws.max_row
         row_bg = _fill(tier_row_fill.get(tier, STRIPE_ODD))
+        default_stripe = _fill(STRIPE_EVEN if rank % 2 == 0 else STRIPE_ODD)
 
         for col_idx, val in enumerate(row_vals, 1):
             cell = ws.cell(xl_row, col_idx)
             cell.border = thin_border
-            cell.fill = _fill(STRIPE_EVEN if rank % 2 == 0 else STRIPE_ODD)
+            cell.fill = default_stripe
 
             if col_idx == 1:
                 cell.font = _body_font(color=GREY_FONT)
@@ -248,23 +289,32 @@ def save_score_breakdown_excel(
                 cell.number_format = "0.0000"
                 cell.alignment = _centre()
                 cell.font = _body_font(bold=True, color=GREEN_SCORE if val >= 0.6 else (RED_SCORE if val < 0.4 else "FF0D1B2A"))
-            elif col_idx <= 3 + (len(pm_keys) + 1 if pm_keys else 1):
+            elif col_idx <= 3 + n_transformer_cols:
                 cell.number_format = "+0.0000;-0.0000;0.0000"
                 cell.alignment = _centre()
                 cell.font = _body_font(color="FF1B5E20" if val > 0 else RED_SCORE) if isinstance(val, float) else _body_font()
-            elif col_idx <= n_cols_total - 1:
+            elif col_idx <= n_cols_total - 2:
                 cell.number_format = "0.0000"
                 cell.alignment = _centre()
                 cell.font = _body_font()
-            else:
+            elif col_idx == n_cols_total - 1:
                 cell.font = Font(name="Arial", bold=True, color=tier_font_clr.get(tier, GREY_FONT), size=9)
+                cell.alignment = _centre()
+            else:
+                # Data Quality column — flagged rows get the amber fill/font
+                # regardless of tier, so a BUY-tier stock with insufficient
+                # history is still visibly distinct from a fully-scored BUY.
+                cell.font = Font(name="Arial", bold=True, color=LOW_QUALITY_FONT if low_quality else GREEN_HDR, size=9)
                 cell.alignment = _centre()
 
         for col_idx in range(1, n_cols_total + 1):
-            if col_idx != n_cols_total:
+            if col_idx == n_cols_total:
+                if low_quality:
+                    ws.cell(xl_row, col_idx).fill = _fill(LOW_QUALITY_FILL)
+            elif col_idx != n_cols_total - 1:
                 ws.cell(xl_row, col_idx).fill = row_bg
 
-    col_widths = [5, 22, 11] + ([13] * len(pm_keys) + [13] if pm_keys else [13]) + [13, 13, 8]
+    col_widths = [5, 22, 11] + ([13] * n_transformer_cols) + [13, 13, 8, 12]
     for col_idx, width in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 

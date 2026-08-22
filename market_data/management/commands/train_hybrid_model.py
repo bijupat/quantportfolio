@@ -19,6 +19,7 @@ class Command(BaseCommand):
         parser.add_argument('--n-heads', type=int, default=4)
         parser.add_argument('--n-layers', type=int, default=2)
         parser.add_argument('--seq-len', type=int, default=120)
+        parser.add_argument('--horizon', type=int, default=30, help='Forward-return horizon in trading days')
         parser.add_argument('--lstm-units', type=int, default=64)
         parser.add_argument('--no-sentiment', action='store_true', help='Skip news sentiment branch')
 
@@ -58,6 +59,7 @@ class Command(BaseCommand):
             end_date=end_date,
             universe=universe,
             seq_len=options['seq_len'],
+            horizon=options['horizon'],
             epochs=options['epochs'],
             batch_size=options['batch_size'],
             d_model=options['d_model'],
