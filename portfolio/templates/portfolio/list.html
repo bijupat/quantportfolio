@@ -1,5 +1,5 @@
 {% extends "base.html" %} 
-{% block title %}Portfolios — QuantPortfolioAI {% endblock %} 
+{% block title %}Portfolios — QuantPortfolioAI {% endblock %}
 {% block content %}
 <h1 class="mb-4">Portfolios</h1>
 
@@ -34,7 +34,7 @@
         <span class="badge bg-light text-dark border">{{ p.strategy }}</span>
       </td>
       <td class="text-end">{{ p.total_capital|floatformat:2 }}</td>
-      <td class="text-end">{{ p.item_count }}</td>
+      <td class="text-end">{{ p.holdings_count }}</td>
       <td>{{ p.created_at|date:"d M Y H:i" }}</td>
       <td>
         <a

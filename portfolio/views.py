@@ -1,36 +1,30 @@
 """Views for the portfolio app: stored portfolio listing and holdings drill-down."""
 
 from django.contrib.auth.mixins import LoginRequiredMixin
-from django.db.models import Q, QuerySet
+from django.db.models import Count, Q, QuerySet
 from django.views.generic import DetailView, ListView
 
-from portfolio.models import Portfolio
+from portfolio.models import Portfolio, PortfolioStrategy
 
-
-def _visible_portfolios_qs(user) -> QuerySet[Portfolio]:
-    """Returns the Portfolios this user is allowed to see.
-
-    Admins see every portfolio. Analysts see only their own plus
-    ownerless/system-generated portfolios (owner=None) — e.g. those created
-    via CLI/management commands before ownership wiring reaches those paths.
-    """
-    qs = Portfolio.objects.select_related("owner").order_by("-created_at")
-    if user.is_admin_role:
-        return qs
-    return qs.filter(Q(owner=user) | Q(owner__isnull=True))
 
 def _visible_portfolios_qs(user) -> QuerySet[Portfolio]:
     """Returns the Portfolios this user is allowed to see.
 
     Admins see every portfolio. Analysts see their own, ownerless/system-generated
-    ones, and composite-engine-generated ones regardless of which admin triggered
-    the run — composite portfolios are shared analytical output, not personal data,
-    even though Portfolio.owner records who ran the job for audit purposes.
+    ones (e.g. CLI runs without --user-id, or legacy CSV imports), and any
+    PortfolioStrategy.COMPOSITE_AI portfolio regardless of which admin triggered
+    the run — composite-engine portfolios are shared analytical output, not
+    personal data, even though Portfolio.owner still records who ran the job
+    for audit purposes.
     """
-    qs = Portfolio.objects.select_related("owner").order_by("-created_at")
+    qs = Portfolio.objects.select_related("owner").annotate(holdings_count=Count("items"))
+    qs = qs.order_by("-created_at")
     if user.is_admin_role:
         return qs
-    return qs.filter(Q(owner=user) | Q(owner__isnull=True) | Q(strategy="composite_ai"))
+    return qs.filter(
+        Q(owner=user) | Q(owner__isnull=True) | Q(strategy=PortfolioStrategy.COMPOSITE_AI)
+    )
+
 
 class PortfolioListView(LoginRequiredMixin, ListView):
     """Lists database-stored Portfolio records (manage_portfolio --list equivalent)."""
@@ -41,7 +35,14 @@ class PortfolioListView(LoginRequiredMixin, ListView):
     paginate_by = 20
 
     def get_queryset(self) -> QuerySet[Portfolio]:
-        """Restricts the list to portfolios visible to the requesting user."""
+        """Restricts the list to portfolios visible to the requesting user.
+
+        The queryset is pre-annotated with holdings_count (see
+        _visible_portfolios_qs) so the template can read {{ p.holdings_count }}
+        instead of {{ p.item_count }} — avoiding one COUNT(*) query per row
+        that Portfolio.item_count would otherwise issue across a full page
+        of results.
+        """
         return _visible_portfolios_qs(self.request.user)
 
 

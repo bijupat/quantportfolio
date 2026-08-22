@@ -2,6 +2,7 @@ from django.core.management.base import BaseCommand, CommandError
 from portfolio.models import Portfolio
 from portfolio.services.portfolio_service import load_portfolio_from_csv_to_db
 
+
 class Command(BaseCommand):
     help = "Manages stored database portfolios."
 
@@ -22,8 +23,27 @@ class Command(BaseCommand):
         if options['load_csv']:
             csv_path = options['load_csv']
             name = options['name']
+
+            if name == 'imported_portfolio' and Portfolio.objects.filter(name=name).exists():
+                self.stdout.write(self.style.WARNING(
+                    f"No --name given — this will overwrite the existing portfolio "
+                    f"'{name}'. Pass --name to import under a different name instead."
+                ))
+
             self.stdout.write(f"Importing portfolio from {csv_path} as '{name}'...")
-            portfolio = load_portfolio_from_csv_to_db(csv_path, name)
+
+            try:
+                portfolio = load_portfolio_from_csv_to_db(csv_path, name)
+            except FileNotFoundError:
+                raise CommandError(f"CSV file not found: '{csv_path}'")
+            except ValueError as e:
+                # Raised by load_portfolio_from_csv_to_db (missing required
+                # columns, or zero valid rows after validation) or by
+                # save_portfolio_to_db's empty-holdings wipe guard. Surfaced
+                # here as a CommandError so it prints as a clean one-line
+                # message rather than an unhandled traceback.
+                raise CommandError(f"Import failed: {e}")
+
             self.stdout.write(self.style.SUCCESS(f"Successfully imported portfolio ID #{portfolio.id} with {portfolio.items.count()} items!"))
             return
 
@@ -33,7 +53,7 @@ class Command(BaseCommand):
                 p = Portfolio.objects.get(name=name)
             except Portfolio.DoesNotExist:
                 raise CommandError(f"Portfolio '{name}' not found.")
-                
+
             self.stdout.write(self.style.MIGRATE_HEADING(f"Holdings for Portfolio: {p.name}"))
             self.stdout.write(f"{'Symbol':<15} {'Qty':>8} {'Price':>12} {'Alloc %':>10} {'Value (Rs.)':>14}")
             self.stdout.write("-" * 63)
