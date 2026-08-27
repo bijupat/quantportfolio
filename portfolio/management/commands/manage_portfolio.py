@@ -1,4 +1,5 @@
 from django.core.management.base import BaseCommand, CommandError
+from django.db import IntegrityError
 from portfolio.models import Portfolio
 from portfolio.services.portfolio_service import load_portfolio_from_csv_to_db
 
@@ -43,6 +44,22 @@ class Command(BaseCommand):
                 # here as a CommandError so it prints as a clean one-line
                 # message rather than an unhandled traceback.
                 raise CommandError(f"Import failed: {e}")
+            except IntegrityError as e:
+                # Backstop for a PortfolioItem database constraint violation
+                # (see PortfolioItem.Meta.constraints in portfolio/models.py)
+                # that reached bulk_create() despite load_portfolio_from_csv_to_db's
+                # row-level sign validation — e.g. a future producer of the
+                # holdings dict shape that doesn't validate as strictly as the
+                # CSV path does. Caught here so an unexpected constraint hit
+                # still exits as a clean CommandError instead of a raw
+                # traceback; it should not fire in the normal CSV-import path,
+                # since that path filters out negative values before this
+                # point is ever reached.
+                raise CommandError(
+                    f"Import failed: one or more rows violated a database constraint "
+                    f"(e.g. negative quantity/price, or an allocation percentage outside "
+                    f"0-100). Original error: {e}"
+                )
 
             self.stdout.write(self.style.SUCCESS(f"Successfully imported portfolio ID #{portfolio.id} with {portfolio.items.count()} items!"))
             return
