@@ -12,7 +12,8 @@
       ranked, weighted portfolio. Enable "Save reports" to generate downloadable PDF/Excel artifacts.
     </p>
 
-    <form hx-post="{% url 'forecasting:reports_run' %}" hx-target="#composite-status" hx-swap="innerHTML">
+    <form hx-post="{% url 'forecasting:reports_run' %}" hx-target="#composite-status" hx-swap="innerHTML"
+          hx-disabled-elt="#id_run_composite_submit">
       {% csrf_token %}
 
       <label class="form-label">Models to ensemble</label>
@@ -88,9 +89,15 @@
         </div>
       </details>
 
-      <button type="submit" class="btn btn-primary mt-3" {% if not trained_models or not universes %}disabled{% endif %}>
-        Run Composite Engine
+      <button type="submit" id="id_run_composite_submit" class="btn btn-primary mt-3"
+              {% if not trained_models or not universes %}disabled{% endif %}>
+        <span class="run-composite-btn-label">Run Composite Engine</span>
+        <span class="spinner-border spinner-border-sm ms-2 htmx-indicator" role="status" aria-hidden="true"></span>
       </button>
+      <div class="form-text text-muted mt-1">
+        The button disables itself while a run is submitting — this prevents accidentally starting two runs
+        with the same settings at once, which previously could make one run's report save fail.
+      </div>
     </form>
 
     <div id="composite-status" class="mt-3"></div>

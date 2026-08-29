@@ -12,4 +12,5 @@ urlpatterns = [
     path("train/run-hybrid/", views.TrainHybridModelTriggerView.as_view(), name="train_hybrid_trigger"),
     path("reports/", views.ReportsView.as_view(), name="reports"),
     path("reports/run/", views.RunCompositeTriggerView.as_view(), name="reports_run"),
+    path("reports/screener/run/", views.RunScreenerTriggerView.as_view(), name="screener_run"),
 ]

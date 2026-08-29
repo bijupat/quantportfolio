@@ -230,6 +230,13 @@ def compute_config_hash(
     they change which stocks get bought, not how any given stock is scored,
     so two runs differing only in --top-n should share the same config_hash
     and update the same CompositeScore rows rather than fork into duplicates.
+
+    NOTE on concurrent runs sharing a config_hash: see
+    save_composite_scores_to_db's docstring — two runs sharing the same
+    (as_of_date, config_hash) that overlap in time (e.g. the same web-UI
+    form submitted twice in quick succession) are a known, guarded-against
+    race. This function's job is only to derive the hash; the guarding
+    happens where rows are written/read.
     """
     payload = {
         "models": sorted(zip(model_names, model_weights)),
@@ -252,6 +259,39 @@ def save_composite_scores_to_db(
     so re-running an identical config on the same date replaces rather than
     conflicting with (or duplicating) prior results — same idempotent-rerun
     pattern as portfolio_service.save_portfolio_to_db.
+
+    Known race with concurrent overlapping runs (2026-08-28):
+    core.threading_utils.launch_tracked_command() runs every triggered
+    command on its own unguarded daemon thread — there is no locking or
+    per-config serialization between jobs (see README "Known Limitations &
+    Roadmap"). If two run_composite invocations for the SAME (as_of_date,
+    config_hash) — i.e. the same universe/model/weights/sentiment settings
+    on the same day, most commonly from the web UI's Composite Reports form
+    being submitted twice before the first run finishes — overlap in time,
+    the delete-then-recreate pattern below means the SECOND call's delete()
+    can remove the FIRST call's rows out from under it, after the first
+    call has already fetched and returned Python references to those rows.
+    Confirmed: the first call's `run_composite.py` then tries to save a
+    ReportArtifact pointing at one of those now-deleted rows via its
+    `composite_run` FK, which fails with
+    `django.db.utils.IntegrityError: FOREIGN KEY constraint failed` —
+    the row genuinely no longer exists by the time that INSERT runs.
+
+    This function cannot fully prevent that race by itself (true prevention
+    needs either DB-level advisory locking per config_hash, or a real job
+    queue serializing same-config runs — out of scope for the current
+    thread-based execution model, see README roadmap). What it DOES do is
+    make each call's own return value internally consistent: the delete and
+    recreate happen together, and the returned queryset always reflects
+    rows this specific call just wrote (or, if a concurrent call raced
+    ahead of the delete, will still be a self-consistent set of *some*
+    call's writes — never a mix of half-deleted state). The remaining
+    responsibility — not using a stale pre-race reference for the
+    ReportArtifact FK — is handled at the call site in
+    forecasting/management/commands/run_composite.py, which now re-resolves
+    the representative CompositeScore's primary key against the database
+    immediately before that write instead of trusting the reference
+    captured earlier in the run.
     """
     CompositeScore.objects.filter(as_of_date=as_of_date, config_hash=config_hash).delete()
 

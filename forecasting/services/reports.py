@@ -18,6 +18,7 @@ def save_portfolio_report_pdf(
     model_name: str = "Unknown",
     portfolio=None,
     composite_run=None,
+    source: str = ReportArtifact.Source.COMPOSITE,
 ) -> ReportArtifact:
     """Generates a styled PDF report for the portfolio and saves it as a ReportArtifact.
 
@@ -26,6 +27,12 @@ def save_portfolio_report_pdf(
         composite_run: A representative forecasting.models.CompositeScore row for this
             run (see save_composite_scores_to_db) — links the artifact back to the
             scoring config/date it came from, if any.
+        source: Which pipeline produced this report — one of
+            ReportArtifact.Source. Defaults to COMPOSITE since run_composite.py
+            is this function's original/primary caller; forecasting/management/
+            commands/predict.py passes source=ReportArtifact.Source.PREDICT
+            explicitly so its own single-model PDF reports are distinguishable
+            in the Generated Reports table (see ReportArtifact's docstring).
     """
     try:
         from reportlab.lib.pagesizes import A4
@@ -110,7 +117,7 @@ def save_portfolio_report_pdf(
 
         doc.build(story, onFirstPage=page_tmpl, onLaterPages=page_tmpl)
     artifact = ReportArtifact.objects.create(
-        kind=ReportArtifact.PDF, portfolio=portfolio, composite_run=composite_run
+        kind=ReportArtifact.PDF, portfolio=portfolio, composite_run=composite_run, source=source
     )
     now_str = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     with open(tmp.name, 'rb') as f:
@@ -368,10 +375,164 @@ def save_score_breakdown_excel(
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
         wb.save(tmp.name)
     artifact = ReportArtifact.objects.create(
-        kind=ReportArtifact.XLSX, portfolio=portfolio, composite_run=composite_run
+        kind=ReportArtifact.XLSX, portfolio=portfolio, composite_run=composite_run,
+        source=ReportArtifact.Source.COMPOSITE,
     )
     now_ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     with open(tmp.name, 'rb') as f:
         artifact.file.save(f"{now_ts}_score_breakdown.xlsx", File(f))
+    os.remove(tmp.name)
+    return artifact
+
+
+def save_screener_excel(results: list, min_score: int) -> "ReportArtifact | None":
+    """Generates a single-sheet Excel workbook of run_screener results and saves it as a ReportArtifact.
+
+    Companion to save_score_breakdown_excel, at a deliberately simpler scope:
+    the screener is a lighter-weight PASS/FAIL/NEAR MISS filter (see
+    forecasting.services.screener.get_or_screen), not the multi-layer
+    composite pipeline, so this produces one styled sheet rather than the
+    two-sheet Score Breakdown + Portfolio workbook. Row fill color follows
+    each result's status the same way save_score_breakdown_excel colors by
+    tier, for visual consistency across both reports.
+
+    Args:
+        results: List of forecasting.models.ScreenerResult instances, in the
+            order they should appear on the sheet — callers (run_screener.py)
+            already sort these by status/score before calling this, so no
+            re-sorting happens here.
+        min_score: The --min-score threshold this run was screened against,
+            included in the sheet header for context (e.g. so someone
+            reading the report later knows what "PASS" meant for this run).
+
+    Returns:
+        The created ReportArtifact, or None if openpyxl isn't installed or
+        results is empty (nothing meaningful to write).
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        logger.warning("openpyxl not installed.")
+        return None
+
+    if not results:
+        logger.warning("save_screener_excel called with no results — nothing to save.")
+        return None
+
+    import tempfile
+    import os
+
+    NAVY = "FF1E3A5F"
+    WHITE = "FFFFFFFF"
+    GREEN_FILL = "FFE8F5E9"
+    AMBER_FILL = "FFFDF3E3"
+    RED_FILL = "FFFCE4E4"
+    GREY_FILL = "FFF0F0F0"
+    GREEN_HDR = "FF1B5E20"
+    AMBER_HDR = "FFE65100"
+    RED_HDR = "FFB71C1C"
+    GREY_FONT = "FF607D8B"
+    STRIPE_EVEN = "FFF5F7FA"
+    STRIPE_ODD = "FFFFFFFF"
+
+    def _hdr_font(): return Font(name="Arial", bold=True, color=WHITE, size=9)
+    def _body_font(bold=False, color="FF0D1B2A"): return Font(name="Arial", bold=bold, color=color, size=9)
+    def _fill(argb): return PatternFill("solid", fgColor=argb)
+    def _centre(): return Alignment(horizontal="center", vertical="center", wrap_text=True)
+    def _left(): return Alignment(horizontal="left", vertical="center")
+
+    thin = Side(style="thin", color="FFBDBDBD")
+    thin_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    status_fill = {
+        "PASS": GREEN_FILL, "PASS (not selected)": GREEN_FILL,
+        "NEAR MISS": AMBER_FILL, "FAIL": RED_FILL, "NO DATA": GREY_FILL,
+    }
+    status_font_clr = {
+        "PASS": GREEN_HDR, "PASS (not selected)": GREEN_HDR,
+        "NEAR MISS": AMBER_HDR, "FAIL": RED_HDR, "NO DATA": GREY_FONT,
+    }
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Screener Results"
+
+    now_str = datetime.now().strftime("%d %b %Y  %H:%M")
+    passed_count = sum(1 for r in results if r.status == "PASS")
+    ws.append([
+        "QuantPortfolioAI — Screener Results", f"Generated: {now_str}",
+        f"Min Score: {min_score}/6", f"Symbols: {len(results)}", f"Passed: {passed_count}",
+    ])
+    ws.row_dimensions[1].height = 16
+    ws.append([])
+
+    HDR_ROW = 3
+    headers = [
+        "Symbol", "Status", "Score",
+        "Trend", "Momentum", "MACD", "RSI", "Volume", "Drawdown",
+        "Close", "Mom 20D", "Mom 60D", "RSI 14", "Vol Ratio",
+    ]
+    ws.append(headers)
+    for c in range(1, len(headers) + 1):
+        cell = ws.cell(HDR_ROW, c)
+        cell.font = _hdr_font()
+        cell.fill = _fill(NAVY)
+        cell.alignment = _centre()
+        cell.border = thin_border
+    ws.row_dimensions[HDR_ROW].height = 24
+
+    signal_keys = ("s1_trend", "s2_momentum", "s3_macd", "s4_rsi", "s5_volume", "s6_drawdown")
+
+    for r in results:
+        raw = r.raw_values or {}
+        row_vals = [
+            r.symbol.ticker, r.status, r.score,
+            *["✓" if getattr(r, k) else "✗" for k in signal_keys],
+            raw.get("close"), raw.get("mom_20d"), raw.get("mom_60d"),
+            raw.get("rsi_14"), raw.get("vol_ratio"),
+        ]
+        ws.append(row_vals)
+        xl_row = ws.max_row
+        row_fill = _fill(status_fill.get(r.status, STRIPE_ODD))
+
+        for col_idx, val in enumerate(row_vals, 1):
+            cell = ws.cell(xl_row, col_idx)
+            cell.border = thin_border
+            cell.fill = row_fill
+            if col_idx == 1:
+                cell.font = _body_font(bold=True)
+                cell.alignment = _left()
+            elif col_idx == 2:
+                cell.font = Font(name="Arial", bold=True, color=status_font_clr.get(r.status, GREY_FONT), size=9)
+                cell.alignment = _centre()
+            elif col_idx == 3:
+                cell.font = _body_font(bold=True)
+                cell.alignment = _centre()
+            elif col_idx <= 3 + len(signal_keys):
+                cell.font = _body_font()
+                cell.alignment = _centre()
+            else:
+                cell.alignment = _centre()
+                cell.font = _body_font()
+                if isinstance(val, float):
+                    cell.number_format = "0.0000"
+
+    col_widths = [16, 18, 8] + ([9] * len(signal_keys)) + [10, 10, 10, 9, 10]
+    for col_idx, width in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    ws.freeze_panes = "A4"
+    ws.auto_filter.ref = f"A{HDR_ROW}:{get_column_letter(len(headers))}{ws.max_row}"
+
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+        wb.save(tmp.name)
+    artifact = ReportArtifact.objects.create(
+        kind=ReportArtifact.XLSX, source=ReportArtifact.Source.SCREENER
+    )
+    now_ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    with open(tmp.name, 'rb') as f:
+        artifact.file.save(f"{now_ts}_screener_results.xlsx", File(f))
     os.remove(tmp.name)
     return artifact

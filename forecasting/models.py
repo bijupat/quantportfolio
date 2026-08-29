@@ -111,10 +111,38 @@ class ReportArtifact(models.Model):
     left in place, since keeping them around was the direct cause of this bug:
     their mere existence let this FK silently type-check against the wrong
     class instead of failing at import time.
+
+    ``source`` distinguishes which pipeline produced the artifact — the
+    Composite Reports page (forecasting/templates/forecasting/reports.html)
+    renders both the run_composite ("Run Composite Engine") and run_screener
+    ("Run Screener") triggers on one page, feeding a single shared
+    "Generated Reports" table. Before this field, a screener's saved Excel
+    workbook and a composite's saved Excel workbook were both
+    ``kind=XLSX`` with no ``portfolio``/``composite_run`` set on the
+    screener's row (it has no portfolio to link), making the two
+    indistinguishable in that table except by opening the file. This is a
+    plain CharField with choices (not a ForeignKey) since it's a fixed,
+    small, code-defined set of pipeline names, not a queryable related
+    entity — matches the existing ``kind`` field's own pattern on this
+    model. Defaults to COMPOSITE so existing rows (all of which predate
+    this field, and were all produced by run_composite) are migrated
+    correctly with no separate data migration needed.
     """
+
+    class Source(models.TextChoices):
+        COMPOSITE = "composite", "Composite Engine"
+        SCREENER = "screener", "Screener"
+        PREDICT = "predict", "Single-Model Predict"
 
     PDF, XLSX, PNG = "pdf", "xlsx", "png"
     kind              = models.CharField(max_length=10, choices=[(PDF, PDF), (XLSX, XLSX), (PNG, PNG)])
+    source            = models.CharField(
+        max_length=20,
+        choices=Source.choices,
+        default=Source.COMPOSITE,
+        help_text="Which pipeline generated this artifact (composite engine, "
+                   "screener, or standalone predict) — see class docstring.",
+    )
     portfolio         = models.ForeignKey("portfolio.Portfolio", null=True, on_delete=models.SET_NULL)
     composite_run     = models.ForeignKey(CompositeScore, null=True, on_delete=models.SET_NULL)
     file              = models.FileField(upload_to="reports/")

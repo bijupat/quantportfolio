@@ -1,4 +1,4 @@
-"""Views for the forecasting app: model training and composite reports."""
+"""Views for the forecasting app: model training, composite reports, and the screener."""
 
 from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
@@ -114,16 +114,17 @@ class TrainHybridModelTriggerView(AdminRequiredMixin, View):
 
 
 class ReportsView(LoginRequiredMixin, TemplateView):
-    """Composite/ensemble results and generated ReportArtifact downloads."""
+    """Composite/ensemble results, the screener, and generated ReportArtifact downloads."""
 
     template_name = "forecasting/reports.html"
 
     def get_context_data(self, **kwargs) -> dict:
-        """Adds registered models, universes, recent composite jobs, and generated reports."""
+        """Adds registered models, universes, recent composite/screener jobs, and generated reports."""
         context = super().get_context_data(**kwargs)
         context["trained_models"] = TrainedModel.objects.order_by("-created_at")
         context["universes"] = Universe.objects.order_by("name")
         context["recent_jobs"] = JobRun.objects.filter(command_name="run_composite")[:10]
+        context["recent_screener_jobs"] = JobRun.objects.filter(command_name="run_screener")[:10]
         context["report_artifacts"] = ReportArtifact.objects.select_related(
             "portfolio"
         ).order_by("-created_at")[:20]
@@ -179,4 +180,51 @@ class RunCompositeTriggerView(AdminRequiredMixin, View):
             options["as_of"] = as_of
 
         job = launch_tracked_command("run_composite", user=request.user, **options)
+        return render(request, "core/_job_status.html", {"job": job})
+
+
+class RunScreenerTriggerView(LoginRequiredMixin, View):
+    """Launches `run_screener` in the background with filter settings from the form.
+
+    Unlike RunCompositeTriggerView (AdminRequiredMixin) and the training
+    triggers, the screener is a read-only, side-effect-free filtering pass
+    over existing DB-cached price data (see forecasting/services/screener.py)
+    — no model training, no portfolio persistence — so it's gated the same
+    as the Composite Reports page itself (any logged-in user), not
+    admin-only.
+    """
+
+    def post(self, request: HttpRequest, *args, **kwargs) -> HttpResponse:
+        """Validates form input, starts the job, and renders the shared status partial."""
+        universe = request.POST.get("screener_universe")
+        symbols_raw = request.POST.get("screener_symbols", "").strip()
+
+        if not universe and not symbols_raw:
+            messages.error(request, "Provide a universe or a specific symbol list for the screener.")
+            return redirect("forecasting:reports")
+
+        try:
+            options = {
+                "top_n": int(request.POST.get("screener_top_n") or 30),
+                "min_score": int(request.POST.get("screener_min_score") or 3),
+                "verbose": request.POST.get("screener_verbose") == "on",
+                "save_csv": request.POST.get("screener_save_csv") == "on",
+            }
+        except ValueError:
+            messages.error(request, "Top-N and min-score must be whole numbers.")
+            return redirect("forecasting:reports")
+
+        # --symbols overrides --universe in the command itself (see
+        # run_screener.py's handle()), so only one needs to be passed —
+        # prefer an explicit symbol list when both are somehow present.
+        if symbols_raw:
+            options["symbols"] = [s.strip() for s in symbols_raw.split(",") if s.strip()]
+        else:
+            options["universe"] = universe
+
+        as_of = request.POST.get("screener_as_of")
+        if as_of:
+            options["as_of"] = as_of
+
+        job = launch_tracked_command("run_screener", user=request.user, **options)
         return render(request, "core/_job_status.html", {"job": job})

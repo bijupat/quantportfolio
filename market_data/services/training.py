@@ -84,6 +84,7 @@ def build_dataset_from_db(
     use_sentiment: bool = True,
     is_hybrid: bool = False,
     mode: str = "train",
+    scalers: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Dict, List[str]]:
     """
     Builds (X, y) sequence matrices using Django DB services as the data source.
@@ -105,21 +106,82 @@ def build_dataset_from_db(
             model_transformer.TripleBranchHybridModel.call()).
         mode: "train" (default) computes forward-return labels via
             create_labels() and drops the trailing `horizon` rows near
-            end_date that have no future close to label against. "inference"
-            skips label computation and keeps every row through end_date,
-            returning a single window anchored at the actual most recent
-            available date.
+            end_date that have no future close to label against, and always
+            derives fresh per-symbol/per-column normalization statistics
+            from the full training window being built here — that's the
+            correct source for scalers, since it's the distribution the
+            model is about to learn against. "inference" skips label
+            computation and keeps every row through end_date, returning a
+            single window anchored at the actual most recent available
+            date; see `scalers` below for how normalization is handled in
+            this mode.
+        scalers: Pre-computed per-symbol, per-column {"mean": ..., "std": ...}
+            statistics, as produced by a prior mode="train" call and
+            persisted on TrainedModel.scalers_json (see
+            forecasting.services.predictor.get_or_predict_bulk, which passes
+            trained_model.scalers_json through here). Only consulted when
+            mode="inference" — mode="train" always computes its own fresh
+            scalers regardless of this argument, since a training call *is*
+            the process that produces this artifact in the first place.
+
+            This is the fix for a real inference-correctness bug: a
+            transformer's weights are calibrated against the exact
+            mean/std each input feature had at training time. Previously,
+            mode="inference" recomputed mean/std from scratch every call —
+            but an inference call only ever has a short window in scope
+            (seq_len + ~100 days for one symbol), not the multi-year
+            training distribution, so the resulting normalization was
+            arbitrary per symbol/run and had no relationship to what the
+            model actually learned. This silently produced numerically
+            wrong predictions with no error anywhere in the pipeline: shapes
+            still matched, so nothing failed, it just fed the network inputs
+            on the wrong scale. Confirmed via a side-by-side comparison
+            against a legacy inference path that correctly reused its saved
+            scalers.json — the two pipelines' raw transformer scores for the
+            same symbols/model/date had ~0.12 correlation and a consistent
+            negative bias, which is the expected signature of exactly this
+            bug (short, idiosyncratic recent windows distort each symbol's
+            mean/std differently and unpredictably relative to what the
+            model was calibrated on).
+
+            When `scalers` is supplied and mode="inference", each
+            feature column is normalized using scalers[symbol.ticker][col]
+            if present. If a symbol or column is missing from `scalers`
+            (e.g. a newly-listed stock added to a universe after training,
+            or a feature column added since the model was trained), that
+            column falls back to being computed fresh from the available
+            inference-window data, WITH a warning logged — this is a
+            genuine degraded case worth knowing about, not silently
+            swallowed, but it shouldn't hard-fail inference for the whole
+            symbol over one missing column. When `scalers` is None in
+            inference mode (e.g. a TrainedModel row saved before
+            scalers_json was populated), behavior falls back to the
+            previous recompute-from-window approach for every column, with
+            a single warning logged once per call rather than per column.
 
     Returns:
         Tuple of (X, y, scalers_info, feature_columns). In mode="inference",
         X contains exactly one window per symbol and y is an unused
-        zero-filled placeholder.
+        zero-filled placeholder. scalers_info is always the scalers actually
+        applied (whether freshly computed or reused from the `scalers` arg),
+        so callers can inspect/persist what was really used.
     """
     if mode not in ("train", "inference"):
         raise ValueError(f"mode must be 'train' or 'inference', got {mode!r}")
 
     logger.info(f"=== DB-FIRST DATASET BUILD STARTED (mode={mode}) ===")
-    
+
+    if mode == "inference" and scalers is None:
+        logger.warning(
+            "build_dataset_from_db(mode='inference') called without saved `scalers` — "
+            "falling back to computing normalization statistics from the short inference "
+            "window itself. This reproduces the pre-fix inference-scaling bug for this "
+            "call: predictions will not be normalized the same way the model was trained, "
+            "and will likely be numerically wrong. Pass trained_model.scalers_json as "
+            "`scalers` unless this TrainedModel genuinely predates scalers_json being "
+            "populated (in which case, retrain to get a usable scalers artifact)."
+        )
+
     # 1. Fetch benchmark market context (NIFTY + SENSEX, prefixed) from DB
     ctx_df = get_market_context_features(start_date, end_date)
     
@@ -244,15 +306,48 @@ def build_dataset_from_db(
         feat_arr = feat_df[master_feature_cols].values.astype(np.float32)
         label_arr = feat_df["__label__"].values.astype(np.float32)
 
-        # Z-score normalization per symbol
+        # ── Normalization ────────────────────────────────────────────────
+        # mode="train": always derive fresh mean/std from this symbol's full
+        # training-window feat_arr — this IS the correct source for scalers,
+        # since it's the distribution the model is about to be fit against.
+        #
+        # mode="inference": reuse the saved training-time scalers whenever
+        # available, rather than recomputing from the short inference
+        # window (see the `scalers` parameter docstring above for why that
+        # recompute was a correctness bug, not a stylistic difference).
+        symbol_saved_scalers = (scalers or {}).get(symbol.ticker) if mode == "inference" else None
+        missing_cols_in_saved_scalers: List[str] = []
+
         scaler_dict = {}
         feat_norm = feat_arr.copy().astype(np.float64)
         for i, col in enumerate(master_feature_cols):
-            col_series = clip_outliers(pd.Series(feat_arr[:, i]))
-            mu = float(col_series.mean())
-            sigma = float(col_series.std()) + 1e-9
+            reused = symbol_saved_scalers.get(col) if symbol_saved_scalers else None
+            if reused is not None:
+                mu = float(reused["mean"])
+                sigma = float(reused["std"])
+            else:
+                if mode == "inference" and scalers is not None:
+                    # `scalers` was supplied but doesn't cover this symbol/column —
+                    # a genuine partial-coverage case (new listing, or a feature
+                    # added since training), not the "no scalers passed at all"
+                    # case already warned about above. Track it for a single
+                    # summarized warning after the column loop rather than
+                    # logging once per column.
+                    missing_cols_in_saved_scalers.append(col)
+                col_series = clip_outliers(pd.Series(feat_arr[:, i]))
+                mu = float(col_series.mean())
+                sigma = float(col_series.std())
+            sigma = sigma + 1e-9
             feat_norm[:, i] = (feat_arr[:, i] - mu) / sigma
             scaler_dict[col] = {"mean": mu, "std": sigma}
+
+        if missing_cols_in_saved_scalers:
+            logger.warning(
+                f"[{symbol.ticker}] {len(missing_cols_in_saved_scalers)} feature column(s) "
+                f"not found in saved scalers — fell back to computing them fresh from the "
+                f"inference window: {missing_cols_in_saved_scalers}. This symbol's prediction "
+                f"may be less reliable than one fully covered by the trained model's scalers."
+            )
 
         scalers_info[symbol.ticker] = scaler_dict
 

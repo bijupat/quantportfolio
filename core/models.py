@@ -96,6 +96,28 @@ class JobRun(models.Model):
     Lets an HTMX polling view report progress/output for long-running jobs
     (fetch_prices, seed_universes, train_model, run_composite) that would
     otherwise block the request thread that triggered them.
+
+    ``progress_message``/``progress_current``/``progress_total`` exist to
+    solve a specific gap: ``output`` is only populated once, in
+    ``core.threading_utils.launch_tracked_command``'s ``finally`` block,
+    after the entire management command has returned — a command that
+    takes minutes (e.g. run_composite, ensembling several models across a
+    large universe) shows nothing but a bare "Running" spinner for its
+    whole duration, even though it internally passes through several
+    well-defined stages. These three fields are updated *during* the run
+    via ``core.threading_utils.update_job_progress()``, called explicitly
+    by progress-aware commands (see ``PROGRESS_AWARE_COMMANDS``) at their
+    existing stage boundaries, and are safe to poll from the HTMX status
+    partial the same way ``status`` already is.
+
+    Deliberately NOT reusing ``output`` for this: ``output`` is the
+    captured stdout buffer, only ever written once at the end, and
+    changing that write pattern to "flush periodically" would require
+    threading a shared, lockable buffer through ``call_command`` — a much
+    bigger change than three nullable fields updated via direct
+    ``.update()`` calls (see ``update_job_progress``), which avoids ever
+    saving a stale in-memory ``JobRun`` instance from within the
+    background thread.
     """
 
     class Status(models.TextChoices):
@@ -109,6 +131,26 @@ class JobRun(models.Model):
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
     output = models.TextField(blank=True)
     error = models.TextField(blank=True)
+    progress_message = models.CharField(
+        max_length=255,
+        blank=True,
+        help_text="Latest structured progress message (e.g. 'Step 2/5: Ensemble "
+                   "scoring...'), updated during the run by progress-aware commands. "
+                   "Blank for commands that don't report progress, or before the "
+                   "first update.",
+    )
+    progress_current = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Current step number for progress-aware commands, e.g. 2 of 5. "
+                   "Null if the command hasn't reported a step-based progress yet.",
+    )
+    progress_total = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Total step count for progress-aware commands, e.g. 5. Paired "
+                   "with progress_current for a 'Step X/Y' display.",
+    )
     triggered_by = models.ForeignKey(
         "core.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="job_runs"
     )
@@ -126,3 +168,8 @@ class JobRun(models.Model):
     def is_finished(self) -> bool:
         """Returns True once the job has reached a terminal (success/failed) state."""
         return self.status in (self.Status.SUCCESS, self.Status.FAILED)
+
+    @property
+    def has_progress(self) -> bool:
+        """Returns True if this job has reported at least one progress update."""
+        return bool(self.progress_message)

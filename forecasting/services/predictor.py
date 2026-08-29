@@ -26,7 +26,22 @@ logger = logging.getLogger(__name__)
 # forever per (symbol, model, as_of_date) with no way to tell a row computed
 # under old, buggy logic apart from one computed after a fix, so both were
 # served from cache identically and indefinitely.
-PIPELINE_VERSION = "2026.08-inference-mode-fix"
+#
+# Bumped 2026-08-28: build_dataset_from_db(mode="inference") now applies
+# TrainedModel.scalers_json (the mean/std each feature actually had at
+# training time) instead of recomputing normalization statistics from the
+# short inference-only window. Every Prediction row cached under the
+# previous version was normalized against an arbitrary, per-call, per-symbol
+# recent-window distribution unrelated to what the model was trained on —
+# confirmed via a side-by-side comparison against a legacy inference path
+# that correctly reused its saved scalers.json, which showed ~0.12
+# correlation and a consistent negative bias against this pipeline's old
+# output for the same symbols/model/date. Those rows are numerically wrong,
+# not just "from an older version" in a cosmetic sense, so this bump is
+# required — see forecasting/management/commands/purge_stale_predictions.py
+# to proactively clear them out rather than waiting for lazy per-request
+# recomputation.
+PIPELINE_VERSION = "2026.08-inference-scaler-fix"
 
 
 def get_or_predict_bulk(symbols: list[Symbol], trained_model: TrainedModel, as_of: date, use_sentiment: bool = True) -> dict:
@@ -82,6 +97,24 @@ def get_or_predict_bulk(symbols: list[Symbol], trained_model: TrainedModel, as_o
     keras_model = trained_model.build_keras_model()
     is_hybrid = trained_model.model_type == TrainedModel.HYBRID
 
+    # The mean/std each feature had at training time — see
+    # build_dataset_from_db's `scalers` parameter docstring
+    # (market_data/services/training.py) for why this must be reused rather
+    # than recomputed from the short inference window. Populated by
+    # train_standard_model_service / train_hybrid_model_service at training
+    # time; may be empty/None for a TrainedModel row saved before
+    # scalers_json existed, in which case build_dataset_from_db falls back
+    # to its previous (less reliable) recompute-from-window behavior and
+    # logs a warning rather than failing.
+    training_scalers = trained_model.scalers_json or None
+    if not training_scalers:
+        logger.warning(
+            f"TrainedModel '{trained_model.name}' has no scalers_json — inference for this "
+            f"model will fall back to computing normalization from each symbol's short "
+            f"inference window, which is less reliable than the model's actual training-time "
+            f"scale. Consider re-running migrate_legacy_model or retraining to populate it."
+        )
+
     predictions_to_write = []
 
     # 3. Process missing symbols
@@ -92,7 +125,9 @@ def get_or_predict_bulk(symbols: list[Symbol], trained_model: TrainedModel, as_o
 
             # mode="inference" — returns the single window ending at the most
             # recent available date up to `as_of`, with no forward-label
-            # requirement.
+            # requirement. Passing `scalers=training_scalers` ensures this
+            # window is normalized the same way the model was trained,
+            # rather than against its own short-window statistics.
             X_arr, _, scalers_info, _ = build_dataset_from_db(
                 symbols=[symbol],
                 start_date=start_history,
@@ -102,6 +137,7 @@ def get_or_predict_bulk(symbols: list[Symbol], trained_model: TrainedModel, as_o
                 use_sentiment=use_sentiment,
                 is_hybrid=is_hybrid,
                 mode="inference",
+                scalers=training_scalers,
             )
 
             if len(X_arr) == 0:

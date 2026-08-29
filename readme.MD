@@ -267,7 +267,7 @@ technical indicators, combined market context, and (optionally) sentiment, then 
 result as a `TrainedModel` row with its weights, architecture, scalers, and eval metrics.
 
 \`\`\`cmd
-python manage.py migrate_legacy_model --name transformer_banking --universe banking
+python manage.py migrate_legacy_model --name transformer_nifty50 --universe nifty50
 \`\`\`
 Imports a pre-Django `.weights.h5` file plus its `_arch.json`/`_scalers.json`/`_eval.json`
 companions from `models/`/`metrics/` into a `TrainedModel` row.
