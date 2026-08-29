@@ -27,7 +27,7 @@ from model_transformer import (
     train_hybrid_model as keras_train_hybrid,
 )
 
-from portfolio_optimizer import walk_forward_splits, score_to_ranking_table, backtest_strategy
+from portfolio_optimizer import walk_forward_splits
 from market_data.services.indicators import (
     FEATURE_COLUMNS, MARKET_CONTEXT_COLS, FINANCIAL_FEATURES, SENTIMENT_FEATURES,
 )
@@ -247,8 +247,8 @@ def train_standard_model_service(
     n_heads: int = 4,
     n_layers: int = 2,
     use_sentiment: bool = True,
-    top_n: int = 10,
-    run_backtest: bool = True,
+    # top_n: int = 10,
+    # run_backtest: bool = True,
 ) -> TrainedModel:
     """
     Trains a QuantTransformer model on DB data and registers it in TrainedModel.
@@ -311,29 +311,7 @@ def train_standard_model_service(
 
     eval_metrics = keras_evaluate_model(model, X_test, y_test)
 
-    # --- Backtest Restoration ---
-    if run_backtest and len(X_test) > 0:
-        logger.info("Running synthetic evaluation backtest on X_test...")
-        predictions = model.predict(X_test, batch_size=128, verbose=0).flatten()
-        
-        # Build synthetic dates & dummy tickers for portfolio optimizer logic
-        dummy_dates = pd.date_range(end=end_date, periods=len(predictions), freq='D')
-        eval_df = pd.DataFrame({
-            "Date": dummy_dates,
-            "Ticker": [f"DUMMY_{i % len(symbols)}" for i in range(len(predictions))],
-            "Score": predictions,
-            "Target": y_test
-        })
-        
-        ranking_table = score_to_ranking_table(eval_df)
-        bt_metrics = backtest_strategy(ranking_table, top_n=top_n)
-        
-        # Merge portfolio metrics into base eval metrics
-        eval_metrics.update({
-            "Backtest_TotalReturn": bt_metrics.get("Total Return", 0.0),
-            "Backtest_Sharpe": bt_metrics.get("Sharpe Ratio", 0.0),
-            "Backtest_MaxDrawdown": bt_metrics.get("Max Drawdown", 0.0)
-        })
+   
 
     arch_data = {
         "seq_len": seq_len,

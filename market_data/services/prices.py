@@ -64,6 +64,26 @@ def get_price_bars(symbol: Symbol, start: date, end: date) -> QuerySet[PriceBar]
     NonTradingDay cache. A regular equity returning no data for a range
     usually just means it wasn't listed yet — symbol-specific, and never
     to be read as "the market was closed for everyone."
+
+    Pre-listing gap optimization (history_confirmed_start): a newly-listed
+    or recently-renamed symbol (e.g. ETERNAL.NS/Zomato, which didn't list
+    until 23 Jul 2021 — see core.models.Symbol.history_confirmed_start's
+    docstring) will have yfinance return an empty DataFrame for every
+    pre-listing date range requested. Without this optimization, every
+    single call to get_price_bars() for that symbol across a training
+    window starting before its listing date re-issues the same doomed
+    yfinance queries and re-triggers yfinance's own "possibly delisted"
+    warning for each chunk, every run, forever — since no PriceBar rows
+    exist to satisfy `existing_dates`, and (correctly) no NonTradingDay
+    rows get written either, since only MARKET_CALENDAR_AUTHORITIES may do
+    that. Once a fetch has confirmed where real data actually begins for
+    this specific symbol, that boundary is remembered on
+    symbol.history_confirmed_start, and this function raises its internal
+    fetch start up to that boundary on every subsequent call — the queried
+    range returned to the caller still honors whatever range they actually
+    asked for (rows simply won't exist before the confirmed start, exactly
+    as before this optimization), only the *yfinance* fetch range is
+    narrowed.
     """
     existing_dates = set(
         PriceBar.objects.filter(symbol=symbol, date__range=(start, end))
@@ -76,8 +96,21 @@ def get_price_bars(symbol: Symbol, start: date, end: date) -> QuerySet[PriceBar]
 
     is_calendar_authority = symbol.ticker in MARKET_CALENDAR_AUTHORITIES
 
+    # Skip re-querying yfinance for any date already proven to have no data
+    # for THIS symbol, per a prior confirmed start. Calendar-authority
+    # tickers (^NSEI, ^BSESN) are exempted — they're the ones establishing
+    # NonTradingDay in the first place and have effectively unbounded
+    # history, so this optimization has nothing to save for them anyway.
+    if not is_calendar_authority and symbol.history_confirmed_start is not None:
+        missing_days = [d for d in missing_days if d >= symbol.history_confirmed_start]
+
     if missing_days:
         logger.info(f"Missing {len(missing_days)} days for {symbol.ticker}. Fetching from yfinance...")
+
+        # Tracks the earliest date any chunk in THIS call actually returned
+        # real data for — used to tighten symbol.history_confirmed_start
+        # once, after the loop, rather than writing to the DB on every chunk.
+        earliest_real_date_this_call: date | None = None
 
         for lo, hi in _contiguous_ranges(missing_days):
             yf_end = hi + timedelta(days=1)
@@ -104,6 +137,10 @@ def get_price_bars(symbol: Symbol, start: date, end: date) -> QuerySet[PriceBar]
                         PriceBar.objects.bulk_create(bars_to_create, ignore_conflicts=True)
 
                     returned_dates = set(pd.to_datetime(df.index).date)
+                    if returned_dates:
+                        chunk_earliest = min(returned_dates)
+                        if earliest_real_date_this_call is None or chunk_earliest < earliest_real_date_this_call:
+                            earliest_real_date_this_call = chunk_earliest
                 else:
                     returned_dates = set()
 
@@ -121,6 +158,20 @@ def get_price_bars(symbol: Symbol, start: date, end: date) -> QuerySet[PriceBar]
                 logger.error(f"Failed to fetch {symbol.ticker} from yfinance: {e}")
 
             time.sleep(0.5)
+
+        # Tighten history_confirmed_start if this call discovered real data
+        # earlier than previously known — never regress it to a LATER date,
+        # which would silently forget an earlier confirmed start recorded
+        # by a prior run (see Symbol.history_confirmed_start's docstring).
+        if earliest_real_date_this_call is not None and not is_calendar_authority:
+            current = symbol.history_confirmed_start
+            if current is None or earliest_real_date_this_call < current:
+                symbol.history_confirmed_start = earliest_real_date_this_call
+                symbol.save(update_fields=["history_confirmed_start"])
+                logger.info(
+                    f"{symbol.ticker}: history_confirmed_start set to "
+                    f"{earliest_real_date_this_call} (earliest real data found this run)."
+                )
 
     return PriceBar.objects.filter(symbol=symbol, date__range=(start, end)).order_by("date")
 

@@ -259,6 +259,7 @@ holiday calendar from `^NSEI` first, then backfills symbol metadata (name/sector
 history per symbol. **Requires `seed_universes` to have been run for that universe.**
 
 \`\`\`cmd
+python manage.py train_model --model-name transformer_nifty50_v2 --universe nifty50 --start 2015-01-01 --epochs 60 --batch-size 64 --d-model 128 --n-heads 8 --n-layers 2 --seq-len 60 --horizon 30
 python manage.py train_model --model-name test_transformer --universe temp --epochs 5
 python manage.py train_hybrid_model --model-name test_hybrid --universe temp --epochs 10
 \`\`\`

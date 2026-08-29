@@ -23,9 +23,9 @@ class Command(BaseCommand):
         parser.add_argument('--horizon', type=int, default=30)
         
         # Restored Legacy Params
-        parser.add_argument('--top-n', type=int, default=10, help='Top N stocks for evaluation tier')
+        # parser.add_argument('--top-n', type=int, default=10, help='Top N stocks for evaluation tier')
         parser.add_argument('--no-sentiment', action='store_true', help='Skip news sentiment')
-        parser.add_argument('--no-backtest', action='store_true', help='Skip backtest after training')
+        # parser.add_argument('--no-backtest', action='store_true', help='Skip backtest after training')
 
     def handle(self, *args, **options):
         model_name = options['model_name']
@@ -81,8 +81,8 @@ class Command(BaseCommand):
             n_heads=options['n_heads'],
             n_layers=options['n_layers'],
             use_sentiment=not options['no_sentiment'],
-            top_n=options['top_n'],                      # Passed to service
-            run_backtest=not options['no_backtest']      # Passed to service
+            # top_n=options['top_n'],                      # Passed to service
+            # run_backtest=not options['no_backtest']      # Passed to service
         )
 
         self.stdout.write(self.style.SUCCESS(f"Training complete! Model registered in DB with ID #{trained_model.id}"))

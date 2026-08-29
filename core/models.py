@@ -60,6 +60,27 @@ class Symbol(models.Model):
                    "Z-Score and flag Piotroski interpretation caveats.",
     )
     is_active: bool = models.BooleanField(default=True)
+    history_confirmed_start = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Earliest date for which yfinance has ever returned a real "
+                   "PriceBar for this symbol, across all fetches so far. Set/"
+                   "tightened by market_data.services.prices.get_price_bars — "
+                   "once known, any future fetch requesting an earlier `start` "
+                   "can skip straight to this date instead of re-querying "
+                   "yfinance (and re-hitting its 'possibly delisted' warning) "
+                   "for a pre-listing window already proven empty. Only ever "
+                   "moved EARLIER by a new fetch that proves older data exists "
+                   "than previously known — never blindly overwritten with a "
+                   "later value, which would silently forget an earlier "
+                   "confirmed start from a prior run. Null means no fetch has "
+                   "confirmed anything yet (e.g. a brand-new Symbol row, or "
+                   "one that's never been through get_price_bars). See "
+                   "market_data's resync_history_start command to force "
+                   "re-verification for a specific symbol if yfinance ever "
+                   "surfaces older data than this field currently reflects "
+                   "(e.g. a later corporate-action restatement).",
+    )
 
     def __str__(self) -> str:
         return self.ticker
