@@ -574,6 +574,7 @@ def save_model(model: QuantTransformer, name: str = "transformer_model") -> Path
         f.attrs["n_features"] = model.n_features
         f.attrs["d_model"]    = model.d_model
         f.attrs["n_heads"]    = model.n_heads
+        f.attrs["ff_dim"]     = model.ff_dim
         f.attrs["n_layers"]   = model.n_layers
 
     arch = {
@@ -581,6 +582,7 @@ def save_model(model: QuantTransformer, name: str = "transformer_model") -> Path
         "n_features": model.n_features,
         "d_model":    model.d_model,
         "n_heads":    model.n_heads,
+        "ff_dim":     model.ff_dim,
         "n_layers":   model.n_layers,
     }
     save_json(arch, METRICS_DIR / f"{name}_arch.json")
@@ -703,6 +705,8 @@ def load_model(name: str = "transformer_model"):
                 if extra in f.attrs:
                     v = f.attrs[extra]
                     arch[extra] = int(v) if extra != "model_type" else str(v)
+            if "ff_dim" in f.attrs:                    
+                    arch["ff_dim"] = int(f.attrs["ff_dim"])
             log.info(f"  Architecture from h5 attrs")
 
     if not arch:
@@ -717,6 +721,7 @@ def load_model(name: str = "transformer_model"):
         log.info(f"  Architecture from {arch_path.name}")
 
     model_type = arch.get("model_type", "standard")
+    ff_dim = arch.get("ff_dim", 256)
     log.info(
         f"  Loading '{name}'  type={model_type}  "
         f"seq={arch['seq_len']}  feat={arch['n_features']}  "
@@ -760,6 +765,7 @@ def load_model(name: str = "transformer_model"):
             n_features = arch["n_features"],
             d_model    = arch["d_model"],
             n_heads    = arch["n_heads"],
+            ff_dim     = ff_dim,
             n_layers   = arch["n_layers"],
         )
 
@@ -769,7 +775,7 @@ def load_model(name: str = "transformer_model"):
     # Stamp arch attributes for downstream access (model.seq_len etc.)
     for k, v in arch.items():
         setattr(model, k, v)
-
+    model.ff_dim = ff_dim
     log.info(
         f"  '{name}' loaded  ({model.count_params():,} params)"
     )
@@ -802,17 +808,17 @@ def migrate_model(name: str) -> None:
             "n_heads":    int(input("n_heads    [4]:   ") or 4),
             "n_layers":   int(input("n_layers   [2]:   ") or 2),
         }
-
+    ff_dim = arch.get("ff_dim", 256)
     model = build_transformer_model(**{
         k: arch[k] for k in
         ("seq_len", "n_features", "d_model", "n_heads", "n_layers")
-    })
+    }, ff_dim=ff_dim)
 
     _load_weights_shape_matched(model, weights_path)
 
     for k, v in arch.items():
         setattr(model, k, v)
-
+    model.ff_dim = ff_dim  
     save_model(model, name)
     log.info(f"Migration complete: {name}")
 

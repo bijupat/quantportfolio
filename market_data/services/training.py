@@ -27,7 +27,7 @@ from model_transformer import (
     train_hybrid_model as keras_train_hybrid,
 )
 
-from portfolio_optimizer import walk_forward_splits
+from portfolio_optimizer import walk_forward_splits, score_to_ranking_table, backtest_strategy
 from market_data.services.indicators import (
     FEATURE_COLUMNS, MARKET_CONTEXT_COLS, FINANCIAL_FEATURES, SENTIMENT_FEATURES,
 )
@@ -35,42 +35,11 @@ from util import clip_outliers, build_sequences
 
 logger = logging.getLogger(__name__)
 
-# Piotroski/Altman fundamentals (market_data.services.quality) are fetched
-# from yfinance's *current* financial statements — piotroski.py/altman.py
-# both pull ticker.financials/balance_sheet/cashflow, which yfinance always
-# returns as the company's latest reported fiscal years, regardless of what
-# date is being computed for. There is no point-in-time historical snapshot
-# available from this data source.
-#
-# Without bounding this, build_dataset_from_db's is_hybrid branch would
-# broadcast a single "as of build time" score across the entire feat_df
-# index — which can span a decade — feeding 2025 fundamentals into 2015
-# training rows as if they were true then (bug #2: direct lookahead
-# leakage). This constant bounds how far back that broadcast is allowed to
-# reach before falling back to a neutral value instead.
-#
-# This is a mitigation, not a full fix: it shrinks the leakage window, it
-# doesn't eliminate leakage within that window (the value used is still
-# "whatever's true today," which may differ from what was knowable on any
-# specific day within the window too, e.g. if a new filing landed partway
-# through it). Fully eliminating this would require a point-in-time
-# fundamentals data source, which is out of scope here. Tune down for a
-# stricter (more neutral-filled, less leaky) dataset, or up for more "real"
-# signal at the cost of a wider leakage window.
-HYBRID_FUNDAMENTALS_RECENCY_WINDOW_DAYS = 90
-
-# Neutral fill value for hybrid quality features outside the recency window
-# above, and matches the existing "no data available" convention used
-# elsewhere in this codebase (see quality.compute_composite_quality's
-# p_norm fallback) — a genuinely unknown/inapplicable score, not an
-# assertion that the stock is average.
-NEUTRAL_QUALITY_FILL = 0.5
-
-
 def create_labels(close: pd.Series, horizon: int = 30) -> pd.Series:
     """Forward return label over `horizon` trading days: (close[t+horizon] - close[t]) / close[t]"""
     future_close = close.shift(-horizon)
     return (future_close - close) / (close + 1e-9)
+
 # ---------------------------------------------------------------------------
 # DB-First Dataset Builder
 # ---------------------------------------------------------------------------
@@ -84,7 +53,7 @@ def build_dataset_from_db(
     use_sentiment: bool = True,
     is_hybrid: bool = False,
     mode: str = "train",
-    scalers: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None,
+    scalers: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Dict, List[str]]:
     """
     Builds (X, y) sequence matrices using Django DB services as the data source.
@@ -94,77 +63,14 @@ def build_dataset_from_db(
         start_date: Start of the price/feature history window.
         end_date: End of the price/feature history window (inclusive).
         seq_len: Length of each input sequence window.
-        horizon: Forward-return horizon in trading days. Only meaningful in
-            mode="train" (used to compute labels); ignored for label purposes
-            in mode="inference" since no forward label exists yet.
+        horizon: Forward-return horizon in trading days.
         use_sentiment: Whether to join sentiment features onto the feature matrix.
-        is_hybrid: Whether to include hybrid-model fundamental feature columns.
-            See HYBRID_FUNDAMENTALS_RECENCY_WINDOW_DAYS above for how
-            lookahead exposure from quality scores is bounded, and the
-            module docstring above for the [ts | financial | sentiment]
-            column-ordering contract this branch must produce (see
-            model_transformer.TripleBranchHybridModel.call()).
-        mode: "train" (default) computes forward-return labels via
-            create_labels() and drops the trailing `horizon` rows near
-            end_date that have no future close to label against, and always
-            derives fresh per-symbol/per-column normalization statistics
-            from the full training window being built here — that's the
-            correct source for scalers, since it's the distribution the
-            model is about to learn against. "inference" skips label
-            computation and keeps every row through end_date, returning a
-            single window anchored at the actual most recent available
-            date; see `scalers` below for how normalization is handled in
-            this mode.
-        scalers: Pre-computed per-symbol, per-column {"mean": ..., "std": ...}
-            statistics, as produced by a prior mode="train" call and
-            persisted on TrainedModel.scalers_json (see
-            forecasting.services.predictor.get_or_predict_bulk, which passes
-            trained_model.scalers_json through here). Only consulted when
-            mode="inference" — mode="train" always computes its own fresh
-            scalers regardless of this argument, since a training call *is*
-            the process that produces this artifact in the first place.
-
-            This is the fix for a real inference-correctness bug: a
-            transformer's weights are calibrated against the exact
-            mean/std each input feature had at training time. Previously,
-            mode="inference" recomputed mean/std from scratch every call —
-            but an inference call only ever has a short window in scope
-            (seq_len + ~100 days for one symbol), not the multi-year
-            training distribution, so the resulting normalization was
-            arbitrary per symbol/run and had no relationship to what the
-            model actually learned. This silently produced numerically
-            wrong predictions with no error anywhere in the pipeline: shapes
-            still matched, so nothing failed, it just fed the network inputs
-            on the wrong scale. Confirmed via a side-by-side comparison
-            against a legacy inference path that correctly reused its saved
-            scalers.json — the two pipelines' raw transformer scores for the
-            same symbols/model/date had ~0.12 correlation and a consistent
-            negative bias, which is the expected signature of exactly this
-            bug (short, idiosyncratic recent windows distort each symbol's
-            mean/std differently and unpredictably relative to what the
-            model was calibrated on).
-
-            When `scalers` is supplied and mode="inference", each
-            feature column is normalized using scalers[symbol.ticker][col]
-            if present. If a symbol or column is missing from `scalers`
-            (e.g. a newly-listed stock added to a universe after training,
-            or a feature column added since the model was trained), that
-            column falls back to being computed fresh from the available
-            inference-window data, WITH a warning logged — this is a
-            genuine degraded case worth knowing about, not silently
-            swallowed, but it shouldn't hard-fail inference for the whole
-            symbol over one missing column. When `scalers` is None in
-            inference mode (e.g. a TrainedModel row saved before
-            scalers_json was populated), behavior falls back to the
-            previous recompute-from-window approach for every column, with
-            a single warning logged once per call rather than per column.
-
-    Returns:
-        Tuple of (X, y, scalers_info, feature_columns). In mode="inference",
-        X contains exactly one window per symbol and y is an unused
-        zero-filled placeholder. scalers_info is always the scalers actually
-        applied (whether freshly computed or reused from the `scalers` arg),
-        so callers can inspect/persist what was really used.
+        is_hybrid: Determines feature ordering. Fundamentals support removed due to lookahead bias.
+        mode: "train" (default) or "inference". In "train" mode, data is returned UNSCALED.
+            Scaling must happen after walk_forward_splits. In "inference" mode, the provided
+            `scalers` dict is applied.
+        scalers: Pre-computed global per-column {"mean": ..., "std": ...} statistics.
+            Only consulted when mode="inference".
     """
     if mode not in ("train", "inference"):
         raise ValueError(f"mode must be 'train' or 'inference', got {mode!r}")
@@ -175,11 +81,7 @@ def build_dataset_from_db(
         logger.warning(
             "build_dataset_from_db(mode='inference') called without saved `scalers` — "
             "falling back to computing normalization statistics from the short inference "
-            "window itself. This reproduces the pre-fix inference-scaling bug for this "
-            "call: predictions will not be normalized the same way the model was trained, "
-            "and will likely be numerically wrong. Pass trained_model.scalers_json as "
-            "`scalers` unless this TrainedModel genuinely predates scalers_json being "
-            "populated (in which case, retrain to get a usable scalers artifact)."
+            "window itself. This will distort predictions."
         )
 
     # 1. Fetch benchmark market context (NIFTY + SENSEX, prefixed) from DB
@@ -231,43 +133,10 @@ def build_dataset_from_db(
         feat_df.fillna(0.0, inplace=True)
 
         if is_hybrid:
-            # ── Bug #2 mitigation: bounded lookahead for quality features ──
-            # get_quality_scores_bulk returns ONE score per symbol, computed
-            # from yfinance's current financials — see the
-            # HYBRID_FUNDAMENTALS_RECENCY_WINDOW_DAYS docstring above for why
-            # true point-in-time correctness isn't achievable here. Only
-            # rows within the recency window of end_date get that real
-            # value; older rows get a neutral fill instead of a
-            # misattributed one, bounding (not eliminating) the leakage.
-            qual_qs = get_quality_scores_bulk([symbol], end_date)
-            qual_obj = qual_qs.first()
-            p_norm = (qual_obj.piotroski_score / 9.0) if (qual_obj and qual_obj.piotroski_score) else 0.5
-            a_norm = min(max(qual_obj.altman_z, 0.0), 5.0) / 5.0 if (qual_obj and qual_obj.altman_z) else 0.0
-
-            recency_cutoff = pd.Timestamp(end_date) - pd.Timedelta(days=HYBRID_FUNDAMENTALS_RECENCY_WINDOW_DAYS)
-            within_recency_window = feat_df.index >= recency_cutoff
-
-            feat_df["returnOnEquity"] = 0.12
-            feat_df["returnOnAssets"] = 0.05
-            feat_df["trailingPE"] = 0.25
-            feat_df["revenueGrowth"] = 0.10
-            feat_df["debtToEquity"] = 0.15
-            feat_df["freeCashflow_norm"] = 0.05
-            feat_df["piotroski_score_norm"] = np.where(within_recency_window, p_norm, NEUTRAL_QUALITY_FILL)
-            feat_df["altman_z_norm"] = np.where(within_recency_window, a_norm, NEUTRAL_QUALITY_FILL)
-
-            # ── Bug #1 fix: explicit [ts | financial | sentiment] ordering ──
-            # TripleBranchHybridModel.call() (model_transformer.py) slices
-            # positionally: x[:, :, :n_ts], x[:, 0, n_ts:n_ts+n_fin],
-            # x[:, :, n_ts+n_fin:]. That model code was always correct — the
-            # bug was here: sentiment columns were joined onto feat_df
-            # BEFORE this block runs, so the previous column order was
-            # [ts | sentiment | financial], not [ts | financial | sentiment].
-            # Every hybrid model trained before this fix learned on branches
-            # fed scrambled data (part financial + part sentiment in each
-            # slot) and should be considered invalid / retrained.
-            ts_cols = [c for c in feat_df.columns if c not in FINANCIAL_FEATURES and c not in SENTIMENT_FEATURES]
-            feat_df = feat_df[ts_cols + FINANCIAL_FEATURES + SENTIMENT_FEATURES]
+            raise NotImplementedError(
+                "Hybrid fundamentals lookup disabled due to severe lookahead bias. "
+                "Point-in-time fundamentals database required before re-enabling."
+            )
         else:
             # Explicit feature-column enforcement (standard/non-hybrid path).
             expected_cols = FEATURE_COLUMNS + MARKET_CONTEXT_COLS
@@ -307,49 +176,35 @@ def build_dataset_from_db(
         label_arr = feat_df["__label__"].values.astype(np.float32)
 
         # ── Normalization ────────────────────────────────────────────────
-        # mode="train": always derive fresh mean/std from this symbol's full
-        # training-window feat_arr — this IS the correct source for scalers,
-        # since it's the distribution the model is about to be fit against.
-        #
-        # mode="inference": reuse the saved training-time scalers whenever
-        # available, rather than recomputing from the short inference
-        # window (see the `scalers` parameter docstring above for why that
-        # recompute was a correctness bug, not a stylistic difference).
-        symbol_saved_scalers = (scalers or {}).get(symbol.ticker) if mode == "inference" else None
-        missing_cols_in_saved_scalers: List[str] = []
-
-        scaler_dict = {}
-        feat_norm = feat_arr.copy().astype(np.float64)
-        for i, col in enumerate(master_feature_cols):
-            reused = symbol_saved_scalers.get(col) if symbol_saved_scalers else None
-            if reused is not None:
-                mu = float(reused["mean"])
-                sigma = float(reused["std"])
-            else:
-                if mode == "inference" and scalers is not None:
-                    # `scalers` was supplied but doesn't cover this symbol/column —
-                    # a genuine partial-coverage case (new listing, or a feature
-                    # added since training), not the "no scalers passed at all"
-                    # case already warned about above. Track it for a single
-                    # summarized warning after the column loop rather than
-                    # logging once per column.
-                    missing_cols_in_saved_scalers.append(col)
-                col_series = clip_outliers(pd.Series(feat_arr[:, i]))
-                mu = float(col_series.mean())
-                sigma = float(col_series.std())
-            sigma = sigma + 1e-9
-            feat_norm[:, i] = (feat_arr[:, i] - mu) / sigma
-            scaler_dict[col] = {"mean": mu, "std": sigma}
-
-        if missing_cols_in_saved_scalers:
-            logger.warning(
-                f"[{symbol.ticker}] {len(missing_cols_in_saved_scalers)} feature column(s) "
-                f"not found in saved scalers — fell back to computing them fresh from the "
-                f"inference window: {missing_cols_in_saved_scalers}. This symbol's prediction "
-                f"may be less reliable than one fully covered by the trained model's scalers."
-            )
-
-        scalers_info[symbol.ticker] = scaler_dict
+        if mode == "train":
+            # Lookahead Leakage Fix: Do NOT scale data here before splitting.
+            # Pass raw unscaled features to build_sequences.
+            feat_norm = feat_arr.copy().astype(np.float32)
+        else:
+            # Inference mode: apply the globally fit scalers from X_train
+            missing_cols_in_saved_scalers: List[str] = []
+            feat_norm = feat_arr.copy().astype(np.float64)
+            for i, col in enumerate(master_feature_cols):
+                reused = (scalers or {}).get(col)
+                if reused is not None:
+                    mu = float(reused["mean"])
+                    sigma = float(reused["std"])
+                else:
+                    if scalers is not None:
+                        missing_cols_in_saved_scalers.append(col)
+                    # Fallback to computing on inference window
+                    col_series = clip_outliers(pd.Series(feat_arr[:, i]))
+                    mu = float(col_series.mean())
+                    sigma = float(col_series.std())
+                sigma = sigma + 1e-9
+                feat_norm[:, i] = (feat_arr[:, i] - mu) / sigma
+                
+            if missing_cols_in_saved_scalers:
+                logger.warning(
+                    f"[{symbol.ticker}] {len(missing_cols_in_saved_scalers)} feature column(s) "
+                    f"not found in saved scalers. Fell back to inference window: "
+                    f"{missing_cols_in_saved_scalers}."
+                )
 
         if mode == "train":
             X_sym, y_sym = build_sequences(feat_norm.astype(np.float32), label_arr, seq_len=seq_len)
@@ -368,10 +223,7 @@ def build_dataset_from_db(
     X_all = np.concatenate(all_X, axis=0)
     y_all = np.concatenate(all_y, axis=0)
 
-    if mode == "train":
-        shuffle_idx = np.random.permutation(len(X_all))
-        X_all = X_all[shuffle_idx]
-        y_all = y_all[shuffle_idx]
+    # REMOVED SHUFFLE HERE to prevent temporal leakage before walk-forward splits.
 
     logger.info(f"DB Dataset created (mode={mode}): X={X_all.shape}, y={y_all.shape}")
     return X_all, y_all, scalers_info, master_feature_cols
@@ -395,11 +247,13 @@ def train_standard_model_service(
     n_heads: int = 4,
     n_layers: int = 2,
     use_sentiment: bool = True,
+    top_n: int = 10,
+    run_backtest: bool = True,
 ) -> TrainedModel:
     """
     Trains a QuantTransformer model on DB data and registers it in TrainedModel.
     """
-    X, y, scalers_info, feature_cols = build_dataset_from_db(
+    X, y, _, feature_cols = build_dataset_from_db(
         symbols=symbols,
         start_date=start_date,
         end_date=end_date,
@@ -407,15 +261,38 @@ def train_standard_model_service(
         horizon=horizon,
         use_sentiment=use_sentiment,
         is_hybrid=False,
+        mode="train"
     )
 
     n_features = X.shape[2]
 
     splits = walk_forward_splits(len(X), train_ratio=0.70, val_ratio=0.15)
     tr_sl, val_sl, te_sl = splits[0]
-    X_train, y_train = X[tr_sl], y[tr_sl]
-    X_val, y_val = X[val_sl], y[val_sl]
-    X_test, y_test = X[te_sl], y[te_sl]
+    # Use .copy() to prevent modifying the original X array via slice views
+    X_train, y_train = X[tr_sl].copy(), y[tr_sl].copy()
+    X_val, y_val = X[val_sl].copy(), y[val_sl].copy()
+    X_test, y_test = X[te_sl].copy(), y[te_sl].copy()
+
+    # --- Lookahead Leakage Fix: Fit Global Scaler ONLY on X_train ---
+    scalers_info = {}
+    for i, col in enumerate(feature_cols):
+        feature_slice = X_train[:, :, i].flatten()
+        mu = float(np.mean(feature_slice))
+        sigma = float(np.std(feature_slice)) + 1e-9
+        
+        scalers_info[col] = {"mean": mu, "std": sigma}
+        
+        X_train[:, :, i] = (X_train[:, :, i] - mu) / sigma
+        X_val[:, :, i] = (X_val[:, :, i] - mu) / sigma
+        X_test[:, :, i] = (X_test[:, :, i] - mu) / sigma
+
+    # Shuffle training data AFTER chronological walk-forward splitting and scaling
+    shuffle_idx = np.random.permutation(len(X_train))
+    X_train = X_train[shuffle_idx]
+    y_train = y_train[shuffle_idx]
+
+    ff_dim = 4 * d_model  
+
 
     model = build_transformer_model(
         seq_len=seq_len,
@@ -434,12 +311,37 @@ def train_standard_model_service(
 
     eval_metrics = keras_evaluate_model(model, X_test, y_test)
 
+    # --- Backtest Restoration ---
+    if run_backtest and len(X_test) > 0:
+        logger.info("Running synthetic evaluation backtest on X_test...")
+        predictions = model.predict(X_test, batch_size=128, verbose=0).flatten()
+        
+        # Build synthetic dates & dummy tickers for portfolio optimizer logic
+        dummy_dates = pd.date_range(end=end_date, periods=len(predictions), freq='D')
+        eval_df = pd.DataFrame({
+            "Date": dummy_dates,
+            "Ticker": [f"DUMMY_{i % len(symbols)}" for i in range(len(predictions))],
+            "Score": predictions,
+            "Target": y_test
+        })
+        
+        ranking_table = score_to_ranking_table(eval_df)
+        bt_metrics = backtest_strategy(ranking_table, top_n=top_n)
+        
+        # Merge portfolio metrics into base eval metrics
+        eval_metrics.update({
+            "Backtest_TotalReturn": bt_metrics.get("Total Return", 0.0),
+            "Backtest_Sharpe": bt_metrics.get("Sharpe Ratio", 0.0),
+            "Backtest_MaxDrawdown": bt_metrics.get("Max Drawdown", 0.0)
+        })
+
     arch_data = {
         "seq_len": seq_len,
         "n_features": n_features,
         "d_model": d_model,
         "n_heads": n_heads,
         "n_layers": n_layers,
+        "ff_dim": ff_dim, 
         "horizon": horizon,
         "model_type": TrainedModel.STANDARD,
     }
@@ -490,130 +392,10 @@ def train_standard_model_service(
     return trained_model
 
 
-def train_hybrid_model_service(
-    model_name: str,
-    symbols: List[Symbol],
-    start_date: date,
-    end_date: date,
-    universe: Optional[Universe] = None,
-    seq_len: int = 120,
-    epochs: int = 60,
-    batch_size: int = 32,
-    d_model: int = 64,
-    n_heads: int = 4,
-    n_layers: int = 2,
-    lstm_units: int = 64,
-    use_sentiment: bool = True,
-) -> TrainedModel:
+def train_hybrid_model_service(*args, **kwargs) -> TrainedModel:
     """
-    Trains a TripleBranchHybridModel on DB data and registers it in TrainedModel.
-
-    NOTE: horizon is currently hardcoded to 30 below (not yet read from a
-    --horizon CLI option, since train_hybrid_model.py has none) — deferred,
-    same as before this pass; only bugs #1 (branch ordering) and #2
-    (fundamentals lookahead) were in scope here.
+    Disabled due to fundamental data lookahead leakage.
+    Requires point-in-time financial statements to safely train.
     """
-    X, y, scalers_info, feature_cols = build_dataset_from_db(
-        symbols=symbols,
-        start_date=start_date,
-        end_date=end_date,
-        seq_len=seq_len,
-        horizon=30,
-        use_sentiment=use_sentiment,
-        is_hybrid=True,
-    )
-
-    n_ts_features = len([c for c in feature_cols if c not in FINANCIAL_FEATURES + SENTIMENT_FEATURES])
-    n_fin_features = len([c for c in feature_cols if c in FINANCIAL_FEATURES])
-    n_sent_features = len([c for c in feature_cols if c in SENTIMENT_FEATURES])
-    n_total = X.shape[2]
-
-    splits = walk_forward_splits(len(X), train_ratio=0.70, val_ratio=0.15)
-    tr_sl, val_sl, te_sl = splits[0]
-    X_train, y_train = X[tr_sl], y[tr_sl]
-    X_val, y_val = X[val_sl], y[val_sl]
-    X_test, y_test = X[te_sl], y[te_sl]
-
-    model = build_hybrid_model(
-        seq_len=seq_len,
-        n_ts_features=n_ts_features,
-        n_financial_features=n_fin_features,
-        n_sentiment_features=n_sent_features,
-        d_model=d_model,
-        n_heads=n_heads,
-        n_layers=n_layers,
-        lstm_units=lstm_units,
-    )
-
-    keras_train_hybrid(
-        model=model, X_train=X_train, y_train=y_train,
-        X_val=X_val, y_val=y_val, model_name=model_name,
-        epochs=epochs, batch_size=batch_size,
-    )
-
-    y_pred = model.predict(X_test, verbose=0).flatten()
-    from scipy.stats import spearmanr
-    mse = float(np.mean((y_test - y_pred) ** 2))
-    mae = float(np.mean(np.abs(y_test - y_pred)))
-    hit = float(np.mean(np.sign(y_test) == np.sign(y_pred)))
-    ic, _ = spearmanr(y_test, y_pred)
-
-    eval_metrics = {
-        "MSE": mse, "MAE": mae, "HitRatio": hit,
-        "IC_Spearman": float(ic) if np.isfinite(ic) else 0.0,
-    }
-
-    arch_data = {
-        "seq_len": seq_len,
-        "n_features": n_total,
-        "d_model": d_model,
-        "n_heads": n_heads,
-        "n_layers": n_layers,
-        "n_ts_features": n_ts_features,
-        "n_financial_features": n_fin_features,
-        "n_sentiment_features": n_sent_features,
-        "model_type": TrainedModel.HYBRID,
-    }
-
-    with tempfile.NamedTemporaryFile(suffix=".weights.h5", delete=False) as tmp_file:
-        tmp_weights_path = tmp_file.name
-
-    try:
-        import h5py
-        with h5py.File(tmp_weights_path, "w") as f:
-            for i, w in enumerate(model.weights):
-                f.create_dataset(f"weight_{i:04d}", data=np.array(w))
-            for k, v in arch_data.items():
-                if isinstance(v, (int, float, str)):
-                    f.attrs[k] = v
-
-        trained_model, _ = TrainedModel.objects.get_or_create(
-            name=model_name,
-            defaults={
-                "model_type": TrainedModel.HYBRID,
-                "seq_len": seq_len,
-                "d_model": d_model,
-                "n_heads": n_heads,
-                "n_layers": n_layers,
-                "n_features": n_total,
-                "arch_json": arch_data,
-                "scalers_json": scalers_info,
-                "eval_json": eval_metrics,
-                "trained_on": universe,
-            }
-        )
-
-        with open(tmp_weights_path, "rb") as f_in:
-            trained_model.weights_file.save(f"{model_name}.weights.h5", File(f_in), save=True)
-
-        trained_model.arch_json = arch_data
-        trained_model.scalers_json = scalers_info
-        trained_model.eval_json = eval_metrics
-        trained_model.save()
-
-    finally:
-        if os.path.exists(tmp_weights_path):
-            os.remove(tmp_weights_path)
-
-    logger.info(f"Successfully trained and registered Hybrid TrainedModel: {model_name}")
-    return trained_model
+    logger.error("train_hybrid_model_service is disabled to prevent lookahead leakage.")
+    raise NotImplementedError("Hybrid fundamentals lookup requires a point-in-time financial database.")

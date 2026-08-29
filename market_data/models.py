@@ -103,6 +103,20 @@ class TrainedModel(models.Model):
     def build_keras_model(self):
         """
         Instantiates the uncompiled Keras architecture and loads the weights.
+
+        ff_dim (standard model only): read from arch_json when present,
+        falling back to build_transformer_model's historical default of 256
+        for TrainedModel rows saved before this field existed (e.g. models
+        imported via migrate_legacy_model from an _arch.json that predates
+        this key, or trained before market_data.services.training's
+        4*d_model convention was introduced). This mirrors
+        model_transformer.py::load_model's own fallback — see that
+        function's docstring for why the fallback value must match
+        build_transformer_model's default exactly, and why any arch_json
+        that DOES carry "ff_dim" must use that value rather than the
+        fallback: reconstructing with the wrong ff_dim builds FFN Dense
+        layers of the wrong shape, which _load_weights_shape_matched()
+        cannot reconcile with these saved weights.
         """
         from model_transformer import build_transformer_model, build_hybrid_model, _load_weights_shape_matched
 
@@ -118,13 +132,16 @@ class TrainedModel(models.Model):
                 lstm_units=self.arch_json.get("lstm_units", 64),
             )
         else:
+            ff_dim = self.arch_json.get("ff_dim", 256)
             model = build_transformer_model(
                 seq_len=self.seq_len,
                 n_features=self.n_features,
                 d_model=self.d_model,
                 n_heads=self.n_heads,
+                ff_dim=ff_dim,
                 n_layers=self.n_layers,
             )
+            model.ff_dim = ff_dim
 
         _load_weights_shape_matched(model, self.weights_file.path)
         
