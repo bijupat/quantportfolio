@@ -86,7 +86,7 @@ def build_dataset_from_db(
 
     # 1. Fetch benchmark market context (NIFTY + SENSEX, prefixed) from DB
     ctx_df = get_market_context_features(start_date, end_date)
-    
+
     all_X, all_y = [], []
     scalers_info = {}
     master_feature_cols = []
@@ -126,7 +126,7 @@ def build_dataset_from_db(
                 sent_df["Date"] = pd.to_datetime(sent_df["Date"])
                 sent_df.set_index("Date", inplace=True)
                 feat_df = feat_df.join(sent_df, how="left")
-            
+
         for c in ["sentiment_score", "positive_count", "negative_count", "news_volume"]:
             if c not in feat_df.columns:
                 feat_df[c] = 0.0
@@ -167,7 +167,7 @@ def build_dataset_from_db(
             for col in master_feature_cols:
                 if col not in feat_df.columns:
                     feat_df[col] = 0.0
-            
+
             label_backup = feat_df["__label__"].copy()
             feat_df = feat_df[master_feature_cols]
             feat_df["__label__"] = label_backup
@@ -198,7 +198,7 @@ def build_dataset_from_db(
                     sigma = float(col_series.std())
                 sigma = sigma + 1e-9
                 feat_norm[:, i] = (feat_arr[:, i] - mu) / sigma
-                
+
             if missing_cols_in_saved_scalers:
                 logger.warning(
                     f"[{symbol.ticker}] {len(missing_cols_in_saved_scalers)} feature column(s) "
@@ -247,11 +247,26 @@ def train_standard_model_service(
     n_heads: int = 4,
     n_layers: int = 2,
     use_sentiment: bool = True,
-    # top_n: int = 10,
-    # run_backtest: bool = True,
 ) -> TrainedModel:
     """
     Trains a QuantTransformer model on DB data and registers it in TrainedModel.
+
+    ff_dim (feed-forward inner dimension) follows the standard Transformer
+    convention of 4 * d_model, computed once below and threaded explicitly
+    into build_transformer_model(). This must be passed as an explicit
+    keyword argument at that call site — build_transformer_model has its own
+    default (ff_dim=256) that silently applies if the argument is omitted,
+    which previously caused every model trained after this convention was
+    introduced to actually be built and trained at ff_dim=256 regardless of
+    d_model, while arch_json/h5 attrs still correctly recorded the intended
+    4*d_model value. That mismatch was invisible at training time (no error,
+    consistent-looking metadata) and only surfaced later as a cryptic
+    ValueError inside Keras' set_weights() during inference, once
+    TrainedModel.build_keras_model() rebuilt the (correctly labeled, larger)
+    architecture from arch_json and tried to load the (silently smaller)
+    saved weight arrays into it. The assert immediately after
+    build_transformer_model() below exists specifically to catch any future
+    regression of this kind at training time instead of inference time.
     """
     X, y, _, feature_cols = build_dataset_from_db(
         symbols=symbols,
@@ -279,9 +294,9 @@ def train_standard_model_service(
         feature_slice = X_train[:, :, i].flatten()
         mu = float(np.mean(feature_slice))
         sigma = float(np.std(feature_slice)) + 1e-9
-        
+
         scalers_info[col] = {"mean": mu, "std": sigma}
-        
+
         X_train[:, :, i] = (X_train[:, :, i] - mu) / sigma
         X_val[:, :, i] = (X_val[:, :, i] - mu) / sigma
         X_test[:, :, i] = (X_test[:, :, i] - mu) / sigma
@@ -291,17 +306,33 @@ def train_standard_model_service(
     X_train = X_train[shuffle_idx]
     y_train = y_train[shuffle_idx]
 
-    ff_dim = 4 * d_model  
-
+    ff_dim = 4 * d_model
 
     model = build_transformer_model(
         seq_len=seq_len,
         n_features=n_features,
         d_model=d_model,
         n_heads=n_heads,
+        ff_dim=ff_dim,
         n_layers=n_layers,
         dropout=0.15,
         lr=1e-4,
+    )
+
+    # Fail loudly, at training time, if the built model's actual ff_dim ever
+    # drifts from what this function intended — see the ff_dim explanation
+    # in this function's docstring for exactly the bug this guards against.
+    # model.ff_dim is set inside build_transformer_model()/QuantTransformer's
+    # __init__ from the ff_dim argument actually used to construct the FFN
+    # Dense layers, so comparing it here confirms the argument really landed
+    # where it needed to, rather than silently falling back to a default.
+    assert model.ff_dim == ff_dim, (
+        f"build_transformer_model() built a model with ff_dim={model.ff_dim}, "
+        f"but this training run intended ff_dim={ff_dim} (4 * d_model={d_model}). "
+        f"Check that ff_dim is being passed explicitly to build_transformer_model() "
+        f"— omitting it silently falls back to that function's own default and "
+        f"produces a model whose real architecture doesn't match what gets "
+        f"recorded in arch_json, causing a shape mismatch later at inference time."
     )
 
     keras_train_model(
@@ -311,19 +342,26 @@ def train_standard_model_service(
 
     eval_metrics = keras_evaluate_model(model, X_test, y_test)
 
-   
-
     arch_data = {
         "seq_len": seq_len,
         "n_features": n_features,
         "d_model": d_model,
         "n_heads": n_heads,
         "n_layers": n_layers,
-        "ff_dim": ff_dim, 
+        "ff_dim": ff_dim,
         "horizon": horizon,
         "model_type": TrainedModel.STANDARD,
     }
 
+    # Build the weights file to a temp path FIRST, with ff_dim (and the rest
+    # of arch_data) embedded in its own h5 attrs — belt-and-suspenders
+    # alongside arch_json, matching model_transformer.py::save_model's
+    # convention. Only once this file exists on disk do we touch the
+    # database, and both the weights_file field and arch_json/scalers_json/
+    # eval_json are written inside the same atomic block below, so a crash
+    # or interruption between "weights saved" and "arch_json saved" can no
+    # longer leave a TrainedModel row whose metadata and actual weight
+    # arrays describe two different architectures.
     with tempfile.NamedTemporaryFile(suffix=".weights.h5", delete=False) as tmp_file:
         tmp_weights_path = tmp_file.name
 
@@ -336,31 +374,60 @@ def train_standard_model_service(
                 if isinstance(v, (int, float, str)):
                     f.attrs[k] = v
 
-        trained_model, _ = TrainedModel.objects.get_or_create(
-            name=model_name,
-            defaults={
-                "model_type": TrainedModel.STANDARD,
-                "seq_len": seq_len,
-                "horizon": horizon,
-                "d_model": d_model,
-                "n_heads": n_heads,
-                "n_layers": n_layers,
-                "n_features": n_features,
-                "arch_json": arch_data,
-                "scalers_json": scalers_info,
-                "eval_json": eval_metrics,
-                "trained_on": universe,
-            }
-        )
+        with transaction.atomic():
+            trained_model, created = TrainedModel.objects.select_for_update().get_or_create(
+                name=model_name,
+                defaults={
+                    "model_type": TrainedModel.STANDARD,
+                    "seq_len": seq_len,
+                    "horizon": horizon,
+                    "d_model": d_model,
+                    "n_heads": n_heads,
+                    "n_layers": n_layers,
+                    "n_features": n_features,
+                    "arch_json": arch_data,
+                    "scalers_json": scalers_info,
+                    "eval_json": eval_metrics,
+                    "trained_on": universe,
+                }
+            )
 
-        with open(tmp_weights_path, "rb") as f_in:
-            trained_model.weights_file.save(f"{model_name}.weights.h5", File(f_in), save=True)
+            if not created:
+                logger.warning(
+                    f"TrainedModel '{model_name}' already existed — overwriting its "
+                    f"architecture, weights, and scalers with this run's output "
+                    f"(old ff_dim={trained_model.arch_json.get('ff_dim')!r}, "
+                    f"new ff_dim={ff_dim!r})."
+                )
 
-        trained_model.horizon = horizon
-        trained_model.arch_json = arch_data
-        trained_model.scalers_json = scalers_info
-        trained_model.eval_json = eval_metrics
-        trained_model.save()
+            # Explicit assignment regardless of `created`, so a retrain under
+            # an existing name always ends up with THIS run's arch_data/
+            # scalers/eval_json — never a stale mix left over from
+            # get_or_create's defaults-skip-on-existing-row behavior.
+            trained_model.model_type = TrainedModel.STANDARD
+            trained_model.seq_len = seq_len
+            trained_model.horizon = horizon
+            trained_model.d_model = d_model
+            trained_model.n_heads = n_heads
+            trained_model.n_layers = n_layers
+            trained_model.n_features = n_features
+            trained_model.arch_json = arch_data
+            trained_model.scalers_json = scalers_info
+            trained_model.eval_json = eval_metrics
+            trained_model.trained_on = universe
+
+            # save=False: stage the file write without triggering its own
+            # separate DB UPDATE — the single trained_model.save() below
+            # commits the weights_file field together with every other
+            # field in one write, so this row can never be observed (by a
+            # concurrent request, or by a crash) in a state where the
+            # weights have changed but arch_json hasn't, or vice versa.
+            with open(tmp_weights_path, "rb") as f_in:
+                trained_model.weights_file.save(
+                    f"{model_name}.weights.h5", File(f_in), save=False
+                )
+
+            trained_model.save()
 
     finally:
         if os.path.exists(tmp_weights_path):
